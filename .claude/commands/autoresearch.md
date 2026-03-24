@@ -47,6 +47,40 @@ NEVER STOP. Once the loop begins, do NOT pause to ask the human. You are autonom
 - If the server dies or `uv run backtest_client.py` returns an error, restart server: `uv run backtest_server.py &`
 - If JSON has `"error"` field, treat as score -999 (revert the change)
 
+## Batch sweep mode (parameter optimization)
+
+When you want to test multiple constant values at once (e.g., sweep BB_PERIOD across 5, 7, 10):
+
+1. Read strategy.py to get the current source
+2. Generate N variants as code strings (each with one constant changed)
+3. Build batch JSON and send to server:
+
+```python
+import json
+with open('strategy.py') as f:
+    base = f.read()
+variants = []
+for val in [5, 7, 10]:
+    code = base.replace('BB_PERIOD = 5', f'BB_PERIOD = {val}')
+    variants.append({"id": f"bb_{val}", "code": code})
+batch = json.dumps({"variants": variants})
+# Send: echo 'batch:{batch}' | uv run backtest_client.py --batch -
+```
+
+Or generate the JSON inline:
+```bash
+python3 -c "..." | uv run backtest_client.py --batch -
+```
+
+The server runs all variants in parallel and returns results sorted by score (best first).
+Each result has: variant_id, score, sharpe, num_trades, total_return_pct, backtest_seconds.
+Errors have: variant_id, score=-999, error_type (syntax/runtime), error message.
+
+Use batch mode for:
+- Parameter sweeps (BB_PERIOD, RSI thresholds, EMA periods, etc.)
+- Testing multiple signal combinations simultaneously
+- Quick grid search before detailed single-experiment refinement
+
 ## Shutdown
 
 When interrupted, kill the server: `kill $(lsof -ti:9877) 2>/dev/null`
