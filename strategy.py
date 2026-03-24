@@ -99,6 +99,17 @@ HTF_RSI_OVERBOUGHT = 70   # skip entries above this
 HTF_RSI_OVERSOLD = 30     # skip entries below this
 HTF_TREND_LOOKBACK = 6    # bars for momentum (6 × 4h = 24h)
 
+# Boom Hunter (Ehlers EOT trio) params
+BH_INPUT_LEN = 120         # bars of closes to feed (100-bar HP cutoff + settling margin)
+BH_EOT1_LP = 6             # fast oscillator period
+BH_EOT2_LP = 27            # trend oscillator period
+BH_EOT3_LP = 11            # extreme detector period
+BH_BULL_THRESHOLD = 0.0    # trigger > threshold = bullish momentum
+BH_BEAR_THRESHOLD = 0.0    # trigger < -threshold = bearish momentum
+BH_EXTREME_OB = 0.8        # EOT3 q5 > this = overbought extreme
+BH_EXTREME_OS = -0.8       # EOT3 q5 < this = oversold extreme
+BH_TREND_WIDTH = 0.3       # |q3-q4| < this = trending (EOT2 converged)
+
 COOLDOWN_BARS = 2
 MIN_VOTES = 4  # out of 7
 
@@ -284,12 +295,13 @@ class Strategy:
 
         return q1, q2
 
-    def _boom_hunter(self, closes):
+    def _boom_hunter(self, closes, eot1_lp=BH_EOT1_LP, eot2_lp=BH_EOT2_LP, eot3_lp=BH_EOT3_LP):
         """Boom Hunter Pro — three EOT instances.
-        Returns (trigger, q2, q3, q4, q5, q6)."""
-        eot1_q1, eot1_q2 = self._ehlers_eot(closes, 6, 0.00, 0.30)
-        eot2_q3, eot2_q4 = self._ehlers_eot(closes, 27, 0.80, 0.30)
-        eot3_q5, eot3_q6 = self._ehlers_eot(closes, 11, 0.99, -0.99)
+        Returns (trigger, q2, q3, q4, q5, q6).
+        Pass closes[-BH_INPUT_LEN:] for performance (~120 bars instead of 500)."""
+        eot1_q1, eot1_q2 = self._ehlers_eot(closes, eot1_lp, 0.00, 0.30)
+        eot2_q3, eot2_q4 = self._ehlers_eot(closes, eot2_lp, 0.80, 0.30)
+        eot3_q5, eot3_q6 = self._ehlers_eot(closes, eot3_lp, 0.99, -0.99)
         # Trigger = SMA(2) of EOT1 Q1
         trigger = np.convolve(eot1_q1, [0.5, 0.5], mode='same')
         return trigger, eot1_q2, eot2_q3, eot2_q4, eot3_q5, eot3_q6
