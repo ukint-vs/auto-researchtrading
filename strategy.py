@@ -199,22 +199,29 @@ class Strategy:
     def _calc_sdo(self, highs, lows, closes, stoch_len=14, donch_len=20, smooth_len=3):
         """Stochastic-Donchian Oscillator. Returns (sdo_smooth, signal_line)."""
         n = len(closes)
-        sdo_raw = np.full(n, 50.0)
         start = max(stoch_len, donch_len)
+        if n <= start:
+            return np.full(n, 50.0), np.full(n, 50.0)
 
-        for i in range(start, n):
-            hh_s = np.max(highs[i - stoch_len + 1:i + 1])
-            ll_s = np.min(lows[i - stoch_len + 1:i + 1])
-            rng_s = hh_s - ll_s
-            stoch = (closes[i] - ll_s) / rng_s * 100 if rng_s > 1e-10 else 50.0
+        h = pd.Series(highs)
+        l = pd.Series(lows)
+        c = pd.Series(closes)
 
-            hh_d = np.max(highs[i - donch_len + 1:i + 1])
-            ll_d = np.min(lows[i - donch_len + 1:i + 1])
-            rng_d = hh_d - ll_d
-            mid_d = (hh_d + ll_d) / 2
-            donch = (closes[i] - mid_d) / rng_d * 100 if rng_d > 1e-10 else 0.0
+        # Stochastic component (rolling max/min over stoch_len)
+        hh_s = h.rolling(stoch_len).max()
+        ll_s = l.rolling(stoch_len).min()
+        rng_s = hh_s - ll_s
+        stoch = ((c - ll_s) / rng_s * 100).where(rng_s > 1e-10, 50.0)
 
-            sdo_raw[i] = 0.5 * stoch + 0.5 * donch
+        # Donchian component (rolling max/min over donch_len)
+        hh_d = h.rolling(donch_len).max()
+        ll_d = l.rolling(donch_len).min()
+        rng_d = hh_d - ll_d
+        mid_d = (hh_d + ll_d) / 2
+        donch = ((c - mid_d) / rng_d * 100).where(rng_d > 1e-10, 0.0)
+
+        sdo_raw = np.full(n, 50.0)
+        sdo_raw[start:] = (0.5 * stoch.values[start:] + 0.5 * donch.values[start:])
 
         # Simple moving average smooth
         kernel = np.ones(smooth_len) / smooth_len
