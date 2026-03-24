@@ -1,17 +1,22 @@
 """
-Exp32: Add Bollinger Band width as 6th signal for vol compression detection.
+Champion strategy (exp112, val 25.05, test 23.44).
 
-Changes from exp28 (ATR 5.5, score 9.382):
-1. Add BB width signal: bullish when BB width is below median (compression = pending breakout)
-2. Keep MIN_VOTES at 4 but out of 6 signals now
-3. BB compression acts as a quality filter for entries
+7-coin equal-weight ensemble with 4/6 majority vote:
+  BTC, ETH, SOL, DOGE, AVAX, LINK, XRP
+Signals: Momentum (12h), very-short momentum (6h), EMA(7/26) crossover,
+  RSI(8), MACD(14/23/9), BB width compression.
+Exits: ATR trailing stop (5.5x, tightened to 3.5x by SDO at extremes),
+  RSI mean-reversion (69/31), signal flip.
+
+Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
+DSP as signal replacement failed (exp103-107), but DSP as EXIT MODIFIER works.
 """
 
 import numpy as np
 from prepare import Signal, PortfolioState, BarData
 
-ACTIVE_SYMBOLS = ["BTC", "ETH", "SOL"]
-SYMBOL_WEIGHTS = {"BTC": 0.33, "ETH": 0.33, "SOL": 0.33}
+ACTIVE_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
+SYMBOL_WEIGHTS = {"BTC": 0.143, "ETH": 0.143, "SOL": 0.143, "DOGE": 0.143, "AVAX": 0.143, "LINK": 0.143, "XRP": 0.143}
 
 SHORT_WINDOW = 6
 MED_WINDOW = 12
@@ -51,7 +56,7 @@ DD_REDUCE_THRESHOLD = 99.0
 DD_REDUCE_SCALE = 0.5
 
 COOLDOWN_BARS = 2
-MIN_VOTES = 4  # out of 6 now
+MIN_VOTES = 4  # out of 6
 
 def ema(values, span):
     alpha = 2.0 / (span + 1)
@@ -141,6 +146,117 @@ class Strategy:
         # Percentile of current width
         pctile = 100 * np.sum(np.array(widths) <= current_width) / len(widths)
         return pctile
+
+    def _ehlers_eot(self, closes, lpperiod, k1, k2):
+        """Ehlers Even-Better Trigonometric Oscillator.
+        Returns (Q1, Q2) numpy arrays — quotient-normalized oscillator lines."""
+        n = len(closes)
+        hp = np.zeros(n)
+        filt = np.zeros(n)
+        peak = np.zeros(n)
+        q1 = np.zeros(n)
+        q2 = np.zeros(n)
+
+        # Highpass filter coefficients (100-bar cycle cutoff)
+        alpha1 = (np.cos(0.707 * 2 * np.pi / 100) +
+                  np.sin(0.707 * 2 * np.pi / 100) - 1) / np.cos(0.707 * 2 * np.pi / 100)
+
+        # Supersmoother coefficients
+        a1 = np.exp(-1.414 * np.pi / lpperiod)
+        b1 = 2 * a1 * np.cos(1.414 * np.pi / lpperiod)
+        c2 = b1
+        c3 = -(a1 * a1)
+        c1 = 1 - c2 - c3
+
+        for i in range(2, n):
+            # Highpass filter
+            hp[i] = ((1 - alpha1 / 2) ** 2 * (closes[i] - 2 * closes[i - 1] + closes[i - 2])
+                     + 2 * (1 - alpha1) * hp[i - 1]
+                     - (1 - alpha1) ** 2 * hp[i - 2])
+            # Supersmoother
+            filt[i] = c1 * (hp[i] + hp[i - 1]) / 2 + c2 * filt[i - 1] + c3 * filt[i - 2]
+            # Peak detector (fast attack, slow decay)
+            peak[i] = max(0.991 * peak[i - 1], abs(filt[i]), 1e-10)
+            # Normalized roofing filter
+            x = filt[i] / peak[i]
+            # Quotient normalization
+            denom1 = k1 * x + 1
+            denom2 = k2 * x + 1
+            q1[i] = (x + k1) / denom1 if abs(denom1) > 1e-10 else 0.0
+            q2[i] = (x + k2) / denom2 if abs(denom2) > 1e-10 else 0.0
+
+        return q1, q2
+
+    def _boom_hunter(self, closes):
+        """Boom Hunter Pro — three EOT instances.
+        Returns (trigger, q2, q3, q4, q5, q6)."""
+        eot1_q1, eot1_q2 = self._ehlers_eot(closes, 6, 0.00, 0.30)
+        eot2_q3, eot2_q4 = self._ehlers_eot(closes, 27, 0.80, 0.30)
+        eot3_q5, eot3_q6 = self._ehlers_eot(closes, 11, 0.99, -0.99)
+        # Trigger = SMA(2) of EOT1 Q1
+        trigger = np.convolve(eot1_q1, [0.5, 0.5], mode='same')
+        return trigger, eot1_q2, eot2_q3, eot2_q4, eot3_q5, eot3_q6
+
+    def _calc_sdo(self, highs, lows, closes, stoch_len=14, donch_len=20, smooth_len=3):
+        """Stochastic-Donchian Oscillator. Returns (sdo_smooth, signal_line)."""
+        n = len(closes)
+        sdo_raw = np.full(n, 50.0)
+        start = max(stoch_len, donch_len)
+
+        for i in range(start, n):
+            hh_s = np.max(highs[i - stoch_len + 1:i + 1])
+            ll_s = np.min(lows[i - stoch_len + 1:i + 1])
+            rng_s = hh_s - ll_s
+            stoch = (closes[i] - ll_s) / rng_s * 100 if rng_s > 1e-10 else 50.0
+
+            hh_d = np.max(highs[i - donch_len + 1:i + 1])
+            ll_d = np.min(lows[i - donch_len + 1:i + 1])
+            rng_d = hh_d - ll_d
+            mid_d = (hh_d + ll_d) / 2
+            donch = (closes[i] - mid_d) / rng_d * 100 if rng_d > 1e-10 else 0.0
+
+            sdo_raw[i] = 0.5 * stoch + 0.5 * donch
+
+        # Simple moving average smooth
+        kernel = np.ones(smooth_len) / smooth_len
+        sdo_smooth = np.convolve(sdo_raw, kernel, mode='same')
+        signal_line = ema(sdo_smooth[start:], 9) if n > start else sdo_smooth
+        # Pad signal_line to full length
+        full_signal = np.full(n, 50.0)
+        full_signal[start:start + len(signal_line)] = signal_line
+        return sdo_smooth, full_signal
+
+    def _calc_rsi_divergence(self, closes, period=8, lookback=14):
+        """RSI with bull/bear divergence detection.
+        Returns (rsi_value, has_bull_div, has_bear_div)."""
+        rsi_val = calc_rsi(closes, period)
+        has_bull_div = False
+        has_bear_div = False
+
+        if len(closes) < lookback + period + 1:
+            return rsi_val, has_bull_div, has_bear_div
+
+        # Compute RSI series over lookback window
+        rsi_series = []
+        for i in range(lookback):
+            idx = len(closes) - lookback + i
+            rsi_series.append(calc_rsi(closes[:idx + 1], period))
+        rsi_arr = np.array(rsi_series)
+        price_arr = closes[-lookback:]
+
+        # Find local minima/maxima (simple: lower than both neighbors)
+        for i in range(1, lookback - 1):
+            # Bull divergence: price lower low, RSI higher low
+            if (price_arr[i] < price_arr[i - 1] and price_arr[i] < price_arr[i + 1]):
+                # This is a price trough — compare to current
+                if price_arr[-1] < price_arr[i] and rsi_arr[-1] > rsi_arr[i]:
+                    has_bull_div = True
+            # Bear divergence: price higher high, RSI lower high
+            if (price_arr[i] > price_arr[i - 1] and price_arr[i] > price_arr[i + 1]):
+                if price_arr[-1] > price_arr[i] and rsi_arr[-1] < rsi_arr[i]:
+                    has_bear_div = True
+
+        return rsi_val, has_bull_div, has_bear_div
 
     def on_bar(self, bar_data, portfolio):
         signals = []
@@ -265,14 +381,24 @@ class Strategy:
                 if symbol not in self.peak_prices:
                     self.peak_prices[symbol] = mid
 
+                # SDO-adaptive ATR stop: tighten when SDO at extremes
+                highs_h = bd.history["high"].values
+                lows_h = bd.history["low"].values
+                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes)
+                atr_mult = ATR_STOP_MULT
+                if current_pos > 0 and sdo_val[-1] > 80:
+                    atr_mult = 3.5  # tighten stop when overbought
+                elif current_pos < 0 and sdo_val[-1] < 20:
+                    atr_mult = 3.5  # tighten stop when oversold
+
                 if current_pos > 0:
                     self.peak_prices[symbol] = max(self.peak_prices[symbol], mid)
-                    stop = self.peak_prices[symbol] - ATR_STOP_MULT * atr
+                    stop = self.peak_prices[symbol] - atr_mult * atr
                     if mid < stop:
                         target = 0.0
                 else:
                     self.peak_prices[symbol] = min(self.peak_prices[symbol], mid)
-                    stop = self.peak_prices[symbol] + ATR_STOP_MULT * atr
+                    stop = self.peak_prices[symbol] + atr_mult * atr
                     if mid > stop:
                         target = 0.0
 
