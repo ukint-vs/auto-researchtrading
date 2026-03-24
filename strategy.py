@@ -28,14 +28,14 @@ EMA_SLOW = 26
 RSI_PERIOD = 8
 RSI_BULL = 50
 RSI_BEAR = 50
-RSI_OVERBOUGHT = 69
-RSI_OVERSOLD = 31
+RSI_OVERBOUGHT = 71
+RSI_OVERSOLD = 29
 
 MACD_FAST = 14
 MACD_SLOW = 23
 MACD_SIGNAL = 9
 
-BB_PERIOD = 7
+BB_PERIOD = 10
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
@@ -55,6 +55,13 @@ HIGH_CORR_THRESHOLD = 99.0
 
 DD_REDUCE_THRESHOLD = 99.0
 DD_REDUCE_SCALE = 0.5
+
+SDO_STOCH_LEN = 14
+SDO_DONCH_LEN = 20
+SDO_SMOOTH_LEN = 3
+SDO_OVERBOUGHT = 80
+SDO_OVERSOLD = 20
+SDO_TIGHT_ATR_MULT = 3.5
 
 COOLDOWN_BARS = 2
 MIN_VOTES = 4  # out of 6
@@ -398,12 +405,13 @@ class Strategy:
                 # SDO-adaptive ATR stop: tighten when SDO at extremes
                 highs_h = bd.history["high"].values
                 lows_h = bd.history["low"].values
-                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes)
+                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes,
+                                            SDO_STOCH_LEN, SDO_DONCH_LEN, SDO_SMOOTH_LEN)
                 atr_mult = ATR_STOP_MULT
-                if current_pos > 0 and sdo_val[-1] > 80:
-                    atr_mult = 3.5  # tighten stop when overbought
-                elif current_pos < 0 and sdo_val[-1] < 20:
-                    atr_mult = 3.5  # tighten stop when oversold
+                if current_pos > 0 and sdo_val[-1] > SDO_OVERBOUGHT:
+                    atr_mult = SDO_TIGHT_ATR_MULT
+                elif current_pos < 0 and sdo_val[-1] < SDO_OVERSOLD:
+                    atr_mult = SDO_TIGHT_ATR_MULT
 
                 if current_pos > 0:
                     self.peak_prices[symbol] = max(self.peak_prices[symbol], mid)
