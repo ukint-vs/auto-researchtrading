@@ -87,7 +87,7 @@ def discover_coins(top_n=PIPELINE_SIZE):
         resp = requests.post(hl_url, json={"type": "metaAndAssetCtxs"}, timeout=30)
         resp.raise_for_status()
         meta, asset_ctxs = resp.json()
-    except Exception as e:
+    except (requests.RequestException, json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
         print(f"  Warning: Hyperliquid API failed ({e}), using default symbols")
         return _default_universe()
 
@@ -176,6 +176,8 @@ def get_symbols(subset="training"):
 
     When subset="training", returns only symbols that have valid data
     for the validation split (>= 1000 bars, no extreme price ratios).
+    Validated results are cached in the universe JSON to avoid re-reading
+    parquet files on every call.
     """
     if os.path.exists(UNIVERSE_CACHE):
         try:
@@ -184,7 +186,19 @@ def get_symbols(subset="training"):
             symbols = universe.get(subset, DEFAULT_SYMBOLS)
             if symbols:
                 if subset == "training":
-                    return _validate_symbols(symbols, "val")
+                    # Use cached validated list if available
+                    cached = universe.get("validated_training")
+                    if cached:
+                        return cached
+                    validated = _validate_symbols(symbols, "val")
+                    # Cache the result
+                    universe["validated_training"] = validated
+                    try:
+                        with open(UNIVERSE_CACHE, "w") as f:
+                            json.dump(universe, f, indent=2)
+                    except OSError:
+                        pass  # non-critical, just skip caching
+                    return validated
                 return symbols
         except (json.JSONDecodeError, KeyError):
             pass
@@ -223,9 +237,10 @@ def _validate_symbols(symbols, split="val"):
 
 
 def save_universe(universe):
-    """Save discovered universe to cache file."""
+    """Save discovered universe to cache file. Clears validated cache."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     universe["timestamp"] = datetime.utcnow().isoformat()
+    universe.pop("validated_training", None)  # force re-validation after fresh discovery
     with open(UNIVERSE_CACHE, "w") as f:
         json.dump(universe, f, indent=2)
     print(f"  Universe saved to {UNIVERSE_CACHE} (version: {universe['version']})")

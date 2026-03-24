@@ -187,8 +187,8 @@ def aggregate_to_4h(history):
 
 
 class Strategy:
-    def __init__(self):
-        self._symbols = get_symbols("training")
+    def __init__(self, symbols=None):
+        self._symbols = symbols if symbols is not None else get_symbols("training")
         self._weight = 1.0 / len(self._symbols) if self._symbols else 1.0
         self.entry_prices = {}
         self.peak_prices = {}

@@ -12,10 +12,12 @@ from prepare import (
     save_universe,
     load_data,
     _select_training_subset,
+    _validate_symbols,
     _default_universe,
     DEFAULT_SYMBOLS,
     UNIVERSE_CACHE,
     CAP_TIERS,
+    DATA_DIR,
     PIPELINE_SIZE,
     TRAINING_SIZE,
     STABLECOINS,
@@ -66,7 +68,8 @@ class TestSelectTrainingSubset(unittest.TestCase):
 class TestDiscoverCoins(unittest.TestCase):
     @patch("prepare.requests.post")
     def test_api_failure_returns_default(self, mock_post):
-        mock_post.side_effect = Exception("timeout")
+        import requests as req
+        mock_post.side_effect = req.RequestException("timeout")
         result = discover_coins()
         assert result["pipeline"] == list(DEFAULT_SYMBOLS)
         assert result["version"] == "v0-default"
@@ -136,7 +139,44 @@ class TestGetSymbols(unittest.TestCase):
         os.unlink(f.name)
 
 
-class TestLoadDataSymbols(unittest.TestCase):
+class TestValidateSymbols(unittest.TestCase):
+    def test_valid_symbols_pass(self):
+        """Symbols with good data should be returned."""
+        result = _validate_symbols(["BTC", "ETH"], "val")
+        assert "BTC" in result
+        assert "ETH" in result
+
+    def test_missing_data_file_excluded(self):
+        """Symbols with no parquet file should be excluded."""
+        result = _validate_symbols(["BTC", "NONEXISTENT_COIN_XYZ"], "val")
+        assert "NONEXISTENT_COIN_XYZ" not in result
+        assert "BTC" in result
+
+    def test_extreme_price_ratio_excluded(self):
+        """Symbols with >1000x price ratio should be excluded."""
+        # HYPE has a 23M x price ratio in val split
+        result = _validate_symbols(["BTC", "HYPE"], "val")
+        assert "HYPE" not in result
+        assert "BTC" in result
+
+    def test_insufficient_bars_excluded(self):
+        """Symbols with < 1000 bars should be excluded."""
+        # kPEPE has < 1000 bars in val split
+        result = _validate_symbols(["BTC", "kPEPE"], "val")
+        assert "kPEPE" not in result
+
+    def test_all_invalid_returns_default(self):
+        """If all symbols fail validation, return DEFAULT_SYMBOLS."""
+        result = _validate_symbols(["NONEXISTENT_1", "NONEXISTENT_2"], "val")
+        assert result == list(DEFAULT_SYMBOLS)
+
+    def test_invalid_split_returns_all(self):
+        """Invalid split name should return symbols unfiltered."""
+        result = _validate_symbols(["BTC", "ETH", "FAKE"], "invalid_split")
+        assert result == ["BTC", "ETH", "FAKE"]
+
+
+class TestLoadDataFilters(unittest.TestCase):
     def test_load_data_accepts_symbols_param(self):
         """load_data with explicit symbols should only load those symbols."""
         data = load_data("val", symbols=["BTC", "ETH"])
@@ -147,6 +187,17 @@ class TestLoadDataSymbols(unittest.TestCase):
         with patch("prepare.get_symbols", return_value=["BTC", "ETH"]):
             data = load_data("val")
             assert all(s in ["BTC", "ETH"] for s in data.keys())
+
+    def test_zero_price_bars_filtered(self):
+        """Bars with close=0 should not appear in loaded data."""
+        data = load_data("val", symbols=["BTC"])
+        if "BTC" in data:
+            assert (data["BTC"]["close"] > 0).all()
+
+    def test_extreme_price_ratio_excluded(self):
+        """Coins with extreme price ratios should be excluded from load."""
+        data = load_data("val", symbols=["HYPE"])
+        assert "HYPE" not in data
 
 
 if __name__ == "__main__":

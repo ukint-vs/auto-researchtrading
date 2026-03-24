@@ -49,10 +49,7 @@ training_symbols = get_symbols("training")
 if set(training_symbols) != set(DEFAULT_SYMBOLS):
     legacy_data = load_data("val", symbols=DEFAULT_SYMBOLS)
     if legacy_data:
-        from strategy import Strategy as LegacyStrat
-        legacy_strat = LegacyStrat()
-        legacy_strat._symbols = list(DEFAULT_SYMBOLS)
-        legacy_strat._weight = 1.0 / len(DEFAULT_SYMBOLS)
+        legacy_strat = Strategy(symbols=list(DEFAULT_SYMBOLS))
         legacy_result = run_backtest(legacy_strat, legacy_data)
         legacy_score = compute_score(legacy_result)
         print(f"\n--- Legacy 7-coin reference ---")
