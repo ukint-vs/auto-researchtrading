@@ -1,29 +1,112 @@
 """
 Resident backtest evaluator. Keeps data hot in memory, reloads strategy on each run.
-Eliminates ~2-3s of startup/import/parquet-load overhead per autoresearch iteration.
+Supports single runs and parallel batch execution of strategy variants.
 
 Usage:
     uv run backtest_server.py              # Start TCP server on port 9877 (default)
     uv run backtest_server.py --port 9878  # Custom port
     uv run backtest_server.py --stdin      # Read from stdin (pipe mode)
-    echo run | nc localhost 9877           # Trigger a backtest from another process
+
+Commands (via TCP):
+    run                          # Reload strategy.py, backtest, return JSON
+    ping                         # Health check
+    batch:{"variants":[...]}     # Parallel batch: run N variants, return sorted results
 """
 
+import os
 import sys
 import time
 import json
+import struct
 import socket
 import signal as sig
 import argparse
+import multiprocessing
 
-from prepare import load_data, run_backtest, compute_score, TIME_BUDGET
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+from prepare import (
+    load_data, run_backtest, compute_score, TIME_BUDGET,
+    Signal, PortfolioState, BarData,
+)
 
 DEFAULT_PORT = 9877
+
+# Global data — loaded once, shared via fork to worker processes
+data = None
+
+
+def _worker_init():
+    """Reset signal handlers in forked workers so they don't inherit server's SIGTERM/SIGINT."""
+    sig.signal(sig.SIGTERM, sig.SIG_DFL)
+    sig.signal(sig.SIGINT, sig.SIG_IGN)
+
+
+def _run_variant(args):
+    """Worker function: exec strategy code, run backtest, return result dict."""
+    variant_id, strategy_code, worker_data = args
+    namespace = {
+        "np": np,
+        "sliding_window_view": sliding_window_view,
+        "Signal": Signal,
+        "PortfolioState": PortfolioState,
+        "BarData": BarData,
+    }
+    try:
+        exec(strategy_code, namespace)
+        if "Strategy" not in namespace:
+            return {"variant_id": variant_id, "score": -999,
+                    "error_type": "runtime", "error": "No Strategy class defined"}
+        strategy = namespace["Strategy"]()
+        result = run_backtest(strategy, worker_data)
+        score = compute_score(result)
+        return {
+            "variant_id": variant_id,
+            "score": round(score, 6),
+            "sharpe": round(result.sharpe, 6),
+            "total_return_pct": round(result.total_return_pct, 6),
+            "max_drawdown_pct": round(result.max_drawdown_pct, 6),
+            "num_trades": result.num_trades,
+            "win_rate_pct": round(result.win_rate_pct, 6),
+            "profit_factor": round(result.profit_factor, 6),
+            "backtest_seconds": round(result.backtest_seconds, 1),
+        }
+    except SyntaxError as e:
+        return {"variant_id": variant_id, "score": -999,
+                "error_type": "syntax", "error": str(e)}
+    except Exception as e:
+        return {"variant_id": variant_id, "score": -999,
+                "error_type": "runtime", "error": str(e)}
+
+
+def handle_batch(batch_json):
+    """Run N strategy variants in parallel, return sorted results."""
+    try:
+        payload = json.loads(batch_json)
+        variants = payload["variants"]
+    except (json.JSONDecodeError, KeyError) as e:
+        return json.dumps({"error": f"invalid batch JSON: {e}"})
+
+    if not variants:
+        return json.dumps([])
+
+    workers = min(len(variants), os.cpu_count() or 4, 8)
+    work = [(v["id"], v["code"], data) for v in variants]
+
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=workers) as pool:
+            results = pool.map(_run_variant, work)
+    except Exception as e:
+        return json.dumps({"error": f"pool: {e}"})
+
+    results.sort(key=lambda r: r.get("score", -999), reverse=True)
+    return json.dumps(results)
 
 
 def handle_run():
     """Reload strategy, run backtest, return JSON result."""
-    # Reload strategy module (picks up autoresearch edits to strategy.py)
     if "strategy" in sys.modules:
         del sys.modules["strategy"]
     try:
@@ -31,7 +114,6 @@ def handle_run():
     except Exception as e:
         return json.dumps({"error": f"import: {e}", "score": -999})
 
-    # Set timeout
     def timeout_handler(signum, frame):
         raise TimeoutError("backtest exceeded time budget")
 
@@ -65,6 +147,21 @@ def handle_run():
         sig.alarm(0)
 
 
+def recv_all(conn, timeout=300):
+    """Read all data from connection until EOF (client does shutdown(SHUT_WR))."""
+    conn.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        except socket.timeout:
+            break
+    return b"".join(chunks).decode().strip()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Resident backtest evaluator")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: 9877)")
@@ -92,10 +189,9 @@ def main():
     server.listen(1)
 
     print(f"Listening on 127.0.0.1:{args.port}", file=sys.stderr)
-    print(f"Client: echo run | nc localhost {args.port}", file=sys.stderr)
+    print(f"Commands: run | ping | batch:{{...}}", file=sys.stderr)
     sys.stderr.flush()
 
-    # Handle SIGTERM/SIGINT for clean shutdown
     def shutdown_handler(signum, frame):
         print("\nShutting down.", file=sys.stderr)
         server.close()
@@ -111,14 +207,19 @@ def main():
             break
 
         try:
-            raw = conn.recv(1024).decode().strip().lower()
+            raw = recv_all(conn, timeout=300)
+
             if raw == "run":
                 result = handle_run()
                 conn.sendall((result + "\n").encode())
             elif raw == "ping":
                 conn.sendall(b'{"status": "ok"}\n')
+            elif raw.startswith("batch:"):
+                batch_json = raw[6:]  # strip "batch:" prefix
+                result = handle_batch(batch_json)
+                conn.sendall((result + "\n").encode())
             else:
-                conn.sendall(b'{"error": "unknown command, send run or ping"}\n')
+                conn.sendall(b'{"error": "unknown command, send: run | ping | batch:{...}"}\n')
         except Exception as e:
             try:
                 conn.sendall(json.dumps({"error": str(e), "score": -999}).encode() + b"\n")
