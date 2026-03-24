@@ -13,7 +13,7 @@ DSP as signal replacement failed (exp103-107), but DSP as EXIT MODIFIER works.
 """
 
 import numpy as np
-import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from prepare import Signal, PortfolioState, BarData
 
 ACTIVE_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
@@ -131,7 +131,7 @@ class Strategy:
 
     def _calc_bb_width_pctile(self, closes, period):
         """Calculate current BB width percentile over lookback."""
-        from numpy.lib.stride_tricks import sliding_window_view
+
         if len(closes) < period * 3:
             return 50.0
         # Rolling mean/std via sliding window (pure numpy, no pandas)
@@ -200,7 +200,7 @@ class Strategy:
 
     def _calc_sdo(self, highs, lows, closes, stoch_len=14, donch_len=20, smooth_len=3):
         """Stochastic-Donchian Oscillator. Returns (sdo_smooth, signal_line)."""
-        from numpy.lib.stride_tricks import sliding_window_view
+
         n = len(closes)
         start = max(stoch_len, donch_len)
         if n <= start:
