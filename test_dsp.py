@@ -145,6 +145,116 @@ def test_calc_rsi_divergence_flat_price():
     assert bear is False, "False bear divergence on flat price"
 
 
+# ── aggregate_to_4h tests ──
+
+def test_aggregate_to_4h_correct_ohlcv():
+    """4h bars should have correct OHLCV from constituent 1h bars."""
+    import pandas as pd
+    from strategy import aggregate_to_4h
+
+    # 8 hourly bars starting at midnight UTC → should produce 2 complete 4h bars
+    base_ts = 1704067200000  # 2024-01-01 00:00 UTC (divisible by 4h)
+    df = pd.DataFrame({
+        "timestamp": [base_ts + i * 3600000 for i in range(8)],
+        "open":   [100, 101, 102, 103, 104, 105, 106, 107],
+        "high":   [110, 111, 112, 113, 114, 115, 116, 117],
+        "low":    [ 90,  91,  92,  93,  94,  95,  96,  97],
+        "close":  [101, 102, 103, 104, 105, 106, 107, 108],
+        "volume": [ 10,  20,  30,  40,  50,  60,  70,  80],
+    })
+    bars = aggregate_to_4h(df)
+    assert len(bars["close"]) == 2, f"Expected 2 4h bars, got {len(bars['close'])}"
+    # First 4h bar: hours 0-3
+    assert bars["open"][0] == 100, "First bar open should be first hour's open"
+    assert bars["high"][0] == 113, "First bar high should be max of 4 highs"
+    assert bars["low"][0] == 90, "First bar low should be min of 4 lows"
+    assert bars["close"][0] == 104, "First bar close should be last hour's close"
+    assert bars["volume"][0] == 100, "First bar volume should be sum of 4 volumes"
+    # Second 4h bar: hours 4-7
+    assert bars["open"][1] == 104
+    assert bars["high"][1] == 117
+    assert bars["low"][1] == 94
+    assert bars["close"][1] == 108
+    assert bars["volume"][1] == 260
+
+
+def test_aggregate_to_4h_short_input():
+    """Input shorter than 4 bars should return as-is without crash."""
+    import pandas as pd
+    from strategy import aggregate_to_4h
+
+    df = pd.DataFrame({
+        "timestamp": [1704067200000, 1704070800000],
+        "open": [100, 101], "high": [110, 111],
+        "low": [90, 91], "close": [101, 102], "volume": [10, 20],
+    })
+    bars = aggregate_to_4h(df)
+    assert len(bars["close"]) == 2
+    assert bars["open"][0] == 100
+
+
+def test_aggregate_to_4h_partial_window():
+    """5 hourly bars should produce 1 complete + 1 partial 4h bar."""
+    import pandas as pd
+    from strategy import aggregate_to_4h
+
+    base_ts = 1704067200000
+    df = pd.DataFrame({
+        "timestamp": [base_ts + i * 3600000 for i in range(5)],
+        "open":   [100, 101, 102, 103, 104],
+        "high":   [110, 111, 112, 113, 114],
+        "low":    [ 90,  91,  92,  93,  94],
+        "close":  [101, 102, 103, 104, 105],
+        "volume": [ 10,  20,  30,  40,  50],
+    })
+    bars = aggregate_to_4h(df)
+    assert len(bars["close"]) == 2, "5h → 1 complete + 1 partial 4h bar"
+    # Partial bar (hour 4 only)
+    assert bars["open"][1] == 104
+    assert bars["close"][1] == 105
+    assert bars["volume"][1] == 50
+
+
+def test_aggregate_to_4h_ratio():
+    """500 hourly bars should produce ~125 4h bars."""
+    import pandas as pd
+    from strategy import aggregate_to_4h
+
+    base_ts = 1704067200000  # aligned to 4h boundary
+    df = pd.DataFrame({
+        "timestamp": [base_ts + i * 3600000 for i in range(500)],
+        "open": np.random.normal(100, 1, 500),
+        "high": np.random.normal(101, 1, 500),
+        "low": np.random.normal(99, 1, 500),
+        "close": np.random.normal(100, 1, 500),
+        "volume": np.random.uniform(10, 100, 500),
+    })
+    bars = aggregate_to_4h(df)
+    assert len(bars["close"]) == 125, f"500h / 4 = 125 bars, got {len(bars['close'])}"
+
+
+def test_aggregate_to_4h_no_nan_inf():
+    """Output should never contain NaN or Inf."""
+    import pandas as pd
+    from strategy import aggregate_to_4h
+
+    base_ts = 1704067200000
+    np.random.seed(42)
+    closes = np.cumsum(np.random.normal(0, 1, 200)) + 100
+    df = pd.DataFrame({
+        "timestamp": [base_ts + i * 3600000 for i in range(200)],
+        "open": closes + np.random.normal(0, 0.1, 200),
+        "high": closes + np.abs(np.random.normal(0, 0.5, 200)),
+        "low": closes - np.abs(np.random.normal(0, 0.5, 200)),
+        "close": closes,
+        "volume": np.random.uniform(1, 100, 200),
+    })
+    bars = aggregate_to_4h(df)
+    for key in ["open", "high", "low", "close", "volume"]:
+        assert not np.any(np.isnan(bars[key])), f"NaN in {key}"
+        assert not np.any(np.isinf(bars[key])), f"Inf in {key}"
+
+
 # ── Run tests ──
 
 if __name__ == "__main__":
