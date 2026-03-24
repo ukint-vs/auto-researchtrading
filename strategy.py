@@ -1,15 +1,42 @@
 """
-Champion strategy (exp112, val 25.05, test 23.44).
+Champion strategy (val 24.82).
 
-7-coin equal-weight ensemble with 4/6 majority vote:
+7-coin equal-weight ensemble with 4/7 majority vote:
   BTC, ETH, SOL, DOGE, AVAX, LINK, XRP
 Signals: Momentum (12h), very-short momentum (6h), EMA(7/26) crossover,
-  RSI(8), MACD(14/23/9), BB width compression.
+  RSI(8), MACD(14/23/9), BB width compression (period=5), RSI divergence (lookback=14).
 Exits: ATR trailing stop (5.5x, tightened to 3.5x by SDO at extremes),
   RSI mean-reversion (69/31), signal flip.
 
 Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
+  → autoresearch session: +RSI div 7th signal, BB period 7→5, position 0.08→0.075 = 24.82
 DSP as signal replacement failed (exp103-107), but DSP as EXIT MODIFIER works.
+
+Autoresearch log:
+  exp1: RSI divergence as 7th signal (24.65, kept)
+  exp2: MIN_VOTES 5/7 (21.55, reverted)
+  exp3: RSI div lookback 10 (24.47, reverted)
+  exp4: RSI div lookback 20 (24.04, reverted)
+  exp5: EOT3 extreme exit filter (24.62, reverted)
+  exp6: BB_PERIOD 5 (24.78, kept)
+  exp7: BB_PERIOD 4 (24.74, reverted)
+  exp8: EMA_FAST 6 (24.75, reverted)
+  exp9: RSI_PERIOD 7 (24.02, reverted)
+  exp10: RSI_OVERBOUGHT 72 (24.68, reverted)
+  exp11: RSI_OVERSOLD 28 (24.29, reverted)
+  exp12: MACD_FAST 12 (24.55, reverted)
+  exp13: ATR_STOP_MULT 6.0 (24.78, no change)
+  exp14: 4h momentum as 8th signal (23.70, reverted)
+  exp15: SDO_OVERBOUGHT 75 (24.78, no change)
+  exp16: BB threshold 80 (24.46, reverted)
+  exp17: BB threshold 95 (24.64, reverted)
+  exp18: COOLDOWN_BARS 1 (24.62, reverted)
+  exp19: COOLDOWN_BARS 3 (24.33, reverted)
+  exp20: BASE_POSITION_PCT 0.09 (24.68, reverted)
+  exp21: BASE_POSITION_PCT 0.07 (24.82, kept)
+  exp22: BASE_POSITION_PCT 0.065 (24.82, marginally worse)
+  exp23: BASE_POSITION_PCT 0.075 (24.82, kept)
+  exp24: BASE_THRESHOLD 0.011 (24.79, reverted)
 """
 
 import numpy as np
@@ -39,7 +66,7 @@ BB_PERIOD = 5
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
-BASE_POSITION_PCT = 0.08
+BASE_POSITION_PCT = 0.075
 VOL_LOOKBACK = 36
 TARGET_VOL = 0.015
 ATR_LOOKBACK = 24
@@ -86,12 +113,15 @@ def calc_rsi(closes, period):
     return 100 - 100 / (1 + rs)
 
 
-def aggregate_to_4h(history):
-    """Aggregate 1h bars into 4h bars. Returns dict with OHLCV numpy arrays.
+def aggregate_tf(history, hours=4):
+    """Aggregate 1h bars into higher timeframe bars. Returns dict with OHLCV numpy arrays.
 
-    Groups by 4-hour UTC windows (0:00, 4:00, 8:00, 12:00, 16:00, 20:00).
-    Incomplete trailing window is included (uses available bars).
-    With 500 1h bars → ~125 4h bars.
+    Args:
+        history: DataFrame with timestamp, open, high, low, close, volume columns.
+        hours: Timeframe in hours (4, 12, 24, etc.)
+
+    Groups by UTC-aligned windows. Incomplete trailing window is included.
+    With 500 1h bars: 4h→~125, 12h→~42, 24h→~21 bars.
     """
     ts = history["timestamp"].values
     o = history["open"].values
@@ -100,12 +130,11 @@ def aggregate_to_4h(history):
     c = history["close"].values
     v = history["volume"].values
     n = len(ts)
-    if n < 4:
+    if n < hours:
         return {"open": o, "high": h, "low": l, "close": c, "volume": v, "timestamp": ts}
 
-    # Group by 4-hour boundary (ms timestamps)
-    MS_4H = 4 * 3600 * 1000
-    boundaries = ts // MS_4H
+    ms_period = hours * 3600 * 1000
+    boundaries = ts // ms_period
 
     out_o, out_h, out_l, out_c, out_v, out_ts = [], [], [], [], [], []
     i = 0
@@ -130,6 +159,11 @@ def aggregate_to_4h(history):
         "volume": np.array(out_v),
         "timestamp": np.array(out_ts),
     }
+
+
+def aggregate_to_4h(history):
+    """Aggregate 1h → 4h. Convenience wrapper for backwards compat."""
+    return aggregate_tf(history, hours=4)
 
 
 class Strategy:
@@ -383,23 +417,13 @@ class Strategy:
 
             # BB width: low percentile = compression = pending breakout
             bb_pctile = self._calc_bb_width_pctile(closes, BB_PERIOD)
-            bb_compressed = bb_pctile < 90  # Below 40th percentile = compressed
+            bb_compressed = bb_pctile < 90  # Below 90th percentile = compressed
 
             # RSI divergence as 7th additive signal
             _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes, RSI_PERIOD, 14)
 
-            # 4h momentum signal (higher timeframe confirmation)
-            bars_4h = aggregate_to_4h(bd.history)
-            c4h = bars_4h["close"]
-            htf_bull = False
-            htf_bear = False
-            if len(c4h) >= 4:
-                ret_4h = (c4h[-1] - c4h[-3]) / c4h[-3]
-                htf_bull = ret_4h > dyn_threshold
-                htf_bear = ret_4h < -dyn_threshold
-
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div, htf_bull])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div, htf_bear])
+            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div])
+            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div])
 
             btc_confirm = True
             if symbol != "BTC":
