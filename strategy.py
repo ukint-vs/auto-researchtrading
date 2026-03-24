@@ -220,10 +220,10 @@ class Strategy:
         # Simple moving average smooth
         kernel = np.ones(smooth_len) / smooth_len
         sdo_smooth = np.convolve(sdo_raw, kernel, mode='same')
-        signal_line = ema(sdo_smooth[start:], 9) if n > start else sdo_smooth
-        # Pad signal_line to full length
         full_signal = np.full(n, 50.0)
-        full_signal[start:start + len(signal_line)] = signal_line
+        if n > start:
+            signal_line = ema(sdo_smooth[start:], 9)
+            full_signal[start:start + len(signal_line)] = signal_line
         return sdo_smooth, full_signal
 
     def _calc_rsi_divergence(self, closes, period=8, lookback=14):
