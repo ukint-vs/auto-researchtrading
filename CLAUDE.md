@@ -162,6 +162,6 @@ rsi_4h = calc_rsi(closes_4h, 8)    # 4h RSI
 
 ## Current Best Score
 
-**22.09** (6 coins, expanded universe, validation set — full run, no timeout). Beat this to keep your change.
-Legacy reference: 25.09 (7 coins, original universe)
+**28.90** (6 coins, expanded universe, validation set — full run, no timeout). Beat this to keep your change.
+Legacy reference: 32.06 (7 coins, original universe)
 BASELINE RESET: expanded from 7 to 6 validated coins on 2026-03-24. Coins: BTC, ETH, XRP, DOGE, SOL, FARTCOIN.

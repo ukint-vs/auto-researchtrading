@@ -1,45 +1,33 @@
 """
-Champion strategy (val 22.09 expanded, legacy 25.09).
+Champion strategy (expanded universe, legacy val 32.06).
 
-N-coin equal-weight ensemble with 4/7 majority vote:
+N-coin equal-weight ensemble with 5/9 majority vote (9 signals):
   Dynamic symbols from get_symbols("training") with 1/N weighting.
-Signals: Momentum (12h), very-short momentum (6h), EMA(7/26) crossover,
-  RSI(8), MACD(15/26/8), BB width compression (period=5), RSI divergence (lookback=14).
-Exits: ATR trailing stop (5.5x, tightened to 3.5x by SDO at extremes),
-  RSI mean-reversion (69/31), signal flip.
+Signals: Momentum (12h), very-short momentum (6h), EMA(2/28) crossover,
+  RSI(4), MACD(14/27/2), BB width compression (period=3, <93rd pctile),
+  RSI divergence (lookback=14), Donchian 8-bar 68% breakout, 3-bar micro momentum.
+Exits: ATR trailing stop (5.5x, tightened to 2.0x by SDO 10/14 at extremes),
+  RSI(4) mean-reversion (74/26), signal flip.
 
 Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
   → autoresearch s1: +RSI div, BB 7→5, pos 0.08→0.075 = 24.82
-  → autoresearch s2: MACD 14/23/9→15/26/8, VOL_LOOKBACK 36→42,
-    BASE_THRESHOLD 0.012→0.014, BTC/ETH weight tilt = 25.12
+  → autoresearch s2: MACD→15/26/8, VOL_LOOKBACK→42, BASE_THRESHOLD→0.014 = 25.09
+  → autoresearch s3: RSI(4), MACD(14/27/2), EMA(2/28), BB(3/<93pctile),
+    Donchian 8-bar 68%, 3-bar micro mom, SDO_TIGHT 2.0, log returns = 32.06
 
-Autoresearch s2 log:
-  exp25: SDO entry filter 30-70 (17.92, reverted)
-  exp26: 4h RSI gate (22.70, reverted)
-  exp27: SDO slope as 8th signal (22.44, reverted)
-  exp28: EMA_SLOW 28 (24.75, reverted)
-  exp29: MACD_SLOW 26 (24.87, kept)
-  exp30: MACD_SLOW 28 (24.69, reverted)
-  exp31: MACD_FAST 16 (24.91, kept)
-  exp32: MACD_FAST 18 (24.50, reverted)
-  exp33: MACD_SIGNAL 10 (24.61, reverted)
-  exp34: MACD_SIGNAL 8 (24.92, kept)
-  exp35: MACD_SIGNAL 7 (24.80, reverted)
-  exp36: MACD_FAST 15 (25.01, kept)
-  exp37: MACD_FAST 17 (25.01, reverted — marginal)
-  exp38: VOL_LOOKBACK 48 (25.02, kept)
-  exp39: VOL_LOOKBACK 60 (24.94, reverted)
-  exp40: VOL_LOOKBACK 42 (25.03, kept)
-  exp41: VOL_LOOKBACK 40 (25.02, reverted)
-  exp42: BASE_THRESHOLD 0.013 (25.06, kept)
-  exp43: BASE_THRESHOLD 0.014 (25.09, kept)
-  exp44: BASE_THRESHOLD 0.015 (24.97, reverted)
-  exp45-47: MED_WINDOW/SHORT_WINDOW tweaks (all reverted)
-  exp48-57: ATR/RSI/SDO/vol tweaks (all same or worse)
-  exp58: BTC/ETH weight tilt 0.17/0.17 (25.12, kept)
-  exp59-62: Weight variations (all worse)
-  exp61: BTC 0.18, ETH 0.16 (25.124, kept — marginal)
-  exp63-74: Various structural/param changes (all reverted)
+Autoresearch s3 log (kept changes only):
+  exp76-92: EMA 7→5, BB 5→3, bb<95, SDO_TIGHT 3.5→2.5, clamp→0.025, ATR_LB→16 (→25.48)
+  exp98-123: EMA_SLOW→28, SDO 10/14, log returns (→25.59)
+  exp130-131: RSI entry/exit 8→4, exit 69/31→74/26 (→27.63 — breakthrough)
+  exp133-145: RSI entry 48/52, EMA_SLOW→31, MACD→14/27/2, tuning (→30.11)
+  exp153: +Donchian 7-bar (30.77)
+  exp165: EMA 5/31→2/28 (30.98)
+  exp178: +3-bar micro momentum, MIN_VOTES 4→5/9 (31.19)
+  exp181: SDO_TIGHT→2.0 (31.34)
+  exp186-189: Donchian 70% range + period 7→8 (31.94)
+  exp191: RSI entry 49/51→48/52 (31.96)
+  exp194-196: BB threshold 95→93 (32.03)
+  exp201: Donchian 70%→68% (32.06)
 """
 
 import numpy as np
@@ -50,29 +38,29 @@ SHORT_WINDOW = 6
 MED_WINDOW = 12
 MED2_WINDOW = 24
 LONG_WINDOW = 36
-EMA_FAST = 7
-EMA_SLOW = 26
+EMA_FAST = 2
+EMA_SLOW = 28
 RSI_PERIOD = 8
-RSI_BULL = 50
-RSI_BEAR = 50
-RSI_OVERBOUGHT = 69
-RSI_OVERSOLD = 31
+RSI_BULL = 48
+RSI_BEAR = 52
+RSI_OVERBOUGHT = 74
+RSI_OVERSOLD = 26
 
-MACD_FAST = 15
-MACD_SLOW = 26
-MACD_SIGNAL = 8
+MACD_FAST = 14
+MACD_SLOW = 27
+MACD_SIGNAL = 2
 
-BB_PERIOD = 5
+BB_PERIOD = 3
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
-BASE_POSITION_PCT = 0.075
-VOL_LOOKBACK = 42
+BASE_POSITION_PCT = 0.065
+VOL_LOOKBACK = 38
 TARGET_VOL = 0.015
-ATR_LOOKBACK = 24
+ATR_LOOKBACK = 16
 ATR_STOP_MULT = 5.5
 TAKE_PROFIT_PCT = 99.0
-BASE_THRESHOLD = 0.014
+BASE_THRESHOLD = 0.013
 BTC_OPPOSE_THRESHOLD = -99.0
 
 PYRAMID_THRESHOLD = 0.015
@@ -83,12 +71,12 @@ HIGH_CORR_THRESHOLD = 99.0
 DD_REDUCE_THRESHOLD = 99.0
 DD_REDUCE_SCALE = 0.5
 
-SDO_STOCH_LEN = 14
-SDO_DONCH_LEN = 20
+SDO_STOCH_LEN = 10
+SDO_DONCH_LEN = 14
 SDO_SMOOTH_LEN = 3
 SDO_OVERBOUGHT = 80
 SDO_OVERSOLD = 20
-SDO_TIGHT_ATR_MULT = 3.5
+SDO_TIGHT_ATR_MULT = 2.0
 
 # Higher timeframe indicator params (used with aggregate_tf)
 HTF_PERIOD = 4            # hours per bar (4, 12, or 24)
@@ -111,7 +99,7 @@ BH_EXTREME_OS = -0.8       # EOT3 q5 < this = oversold extreme
 BH_TREND_WIDTH = 0.3       # |q3-q4| < this = trending (EOT2 converged)
 
 COOLDOWN_BARS = 2
-MIN_VOTES = 4  # out of 7
+MIN_VOTES = 5  # out of 9
 
 def ema(values, span):
     alpha = 2.0 / (span + 1)
@@ -413,10 +401,10 @@ class Strategy:
             realized_vol = self._calc_vol(closes, VOL_LOOKBACK)
             vol_ratio = realized_vol / TARGET_VOL
             dyn_threshold = BASE_THRESHOLD * (0.3 + vol_ratio * 0.7)
-            dyn_threshold = max(0.005, min(0.020, dyn_threshold))
+            dyn_threshold = max(0.005, min(0.025, dyn_threshold))
 
-            ret_vshort = (closes[-1] - closes[-SHORT_WINDOW]) / closes[-SHORT_WINDOW]
-            ret_short = (closes[-1] - closes[-MED_WINDOW]) / closes[-MED_WINDOW]
+            ret_vshort = np.log(closes[-1] / closes[-SHORT_WINDOW])
+            ret_short = np.log(closes[-1] / closes[-MED_WINDOW])
             ret_med = (closes[-1] - closes[-MED2_WINDOW]) / closes[-MED2_WINDOW]
             ret_long = (closes[-1] - closes[-LONG_WINDOW]) / closes[-LONG_WINDOW]
 
@@ -430,7 +418,7 @@ class Strategy:
             ema_bull = ema_fast_arr[-1] > ema_slow_arr[-1]
             ema_bear = ema_fast_arr[-1] < ema_slow_arr[-1]
 
-            rsi = calc_rsi(closes, RSI_PERIOD)
+            rsi = calc_rsi(closes, 4)
             rsi_bull = rsi > RSI_BULL
             rsi_bear = rsi < RSI_BEAR
 
@@ -440,13 +428,22 @@ class Strategy:
 
             # BB width: low percentile = compression = pending breakout
             bb_pctile = self._calc_bb_width_pctile(closes, BB_PERIOD)
-            bb_compressed = bb_pctile < 90  # Below 90th percentile = compressed
+            bb_compressed = bb_pctile < 93  # Below 90th percentile = compressed
 
             # RSI divergence as 7th additive signal
             _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes, RSI_PERIOD, 14)
 
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div])
+            donch_high = np.max(closes[-8:-1])
+            donch_low = np.min(closes[-8:-1])
+            donch_range = donch_high - donch_low
+            donch_bull = closes[-1] >= donch_low + donch_range * 0.68
+            donch_bear = closes[-1] <= donch_low + donch_range * 0.32
+            # 3-bar micro momentum
+            micro_ret = np.log(closes[-1] / closes[-3])
+            micro_bull = micro_ret > 0
+            micro_bear = micro_ret < 0
+            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div, donch_bull, micro_bull])
+            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div, donch_bear, micro_bear])
 
             btc_confirm = True
             if symbol != "BTC":
