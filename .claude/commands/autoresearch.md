@@ -8,16 +8,18 @@ Start the resident backtest server in background FIRST (loads data once, saves ~
 uv run backtest_server.py &
 ```
 
-Wait for "Listening on 127.0.0.1:9877" in stderr before proceeding.
+Wait 5 seconds for it to load data and start listening.
 
 To run a backtest, use:
 ```bash
-echo run | nc -w 120 localhost 9877
+uv run backtest_client.py
 ```
 
-This returns a JSON line with score and metrics. Parse the `score` field.
+This returns a single JSON line. Parse the `score` field. If the server isn't running, it returns `{"error": "server not running", "score": -999}`.
 
-If the server is not running (nc fails), fall back to `uv run backtest.py`.
+If the server is not running, restart it: `uv run backtest_server.py &`
+
+Fallback (no server): `uv run backtest.py` works standalone but is ~2-3s slower per run.
 
 ## Get current best score
 
@@ -29,7 +31,7 @@ Run the backtest once to get the baseline score before starting experiments.
 2. Read the "DSP Building Blocks" section in CLAUDE.md for available methods and experiment ideas
 3. Pick ONE atomic change to try
 4. Edit strategy.py
-5. Run `echo run | nc -w 120 localhost 9877` and parse the JSON `score` field
+5. Run `uv run backtest_client.py` and parse the JSON `score` field
 6. If score IMPROVED over the current best: keep the change, update the docstring with the new score
 7. If score is equal or worse: revert strategy.py to the previous version exactly
 8. Pick the next experiment idea and repeat
@@ -42,7 +44,7 @@ NEVER STOP. Once the loop begins, do NOT pause to ask the human. You are autonom
 - One change per experiment (atomic)
 - Always revert if score doesn't improve
 - Log what you tried and the result in the docstring
-- If the server dies or nc times out, restart it: `uv run backtest_server.py &`
+- If the server dies or `uv run backtest_client.py` returns an error, restart server: `uv run backtest_server.py &`
 - If JSON has `"error"` field, treat as score -999 (revert the change)
 
 ## Shutdown

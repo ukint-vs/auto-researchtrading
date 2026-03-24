@@ -3,8 +3,9 @@ Resident backtest evaluator. Keeps data hot in memory, reloads strategy on each 
 Eliminates ~2-3s of startup/import/parquet-load overhead per autoresearch iteration.
 
 Usage:
-    uv run backtest_server.py              # Start TCP server on port 9877
+    uv run backtest_server.py              # Start TCP server on port 9877 (default)
     uv run backtest_server.py --port 9878  # Custom port
+    uv run backtest_server.py --stdin      # Read from stdin (pipe mode)
     echo run | nc localhost 9877           # Trigger a backtest from another process
 """
 
@@ -67,7 +68,12 @@ def handle_run():
 def main():
     parser = argparse.ArgumentParser(description="Resident backtest evaluator")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: 9877)")
+    parser.add_argument("--stdin", action="store_true", help="Read commands from stdin instead of TCP")
     args = parser.parse_args()
+
+    if args.stdin:
+        run_stdin_mode()
+        return
 
     # Load data ONCE on startup
     t_load = time.time()
@@ -122,20 +128,21 @@ def main():
             conn.close()
 
 
-# Also support stdin mode for backwards compatibility
+def run_stdin_mode():
+    """Read commands from stdin (for piped input: echo run | uv run backtest_server.py --stdin)."""
+    global data
+    data = load_data("val")
+    total_bars = sum(len(df) for df in data.values())
+    print(f"Loaded {total_bars} bars across {len(data)} symbols", file=sys.stderr)
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        if cmd == "quit" or cmd == "exit":
+            break
+        if cmd == "run":
+            result = handle_run()
+            print(result)
+            sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    if not sys.stdin.isatty() and len(sys.argv) == 1:
-        # Piped input mode: read from stdin (backwards compat)
-        data = load_data("val")
-        total_bars = sum(len(df) for df in data.values())
-        print(f"Loaded {total_bars} bars across {len(data)} symbols", file=sys.stderr)
-        for line in sys.stdin:
-            cmd = line.strip().lower()
-            if cmd == "quit" or cmd == "exit":
-                break
-            if cmd == "run":
-                result = handle_run()
-                print(result)
-                sys.stdout.flush()
-    else:
-        main()
+    main()
