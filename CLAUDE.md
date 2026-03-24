@@ -155,4 +155,4 @@ rsi_4h = calc_rsi(closes_4h, 8)    # 4h RSI
 
 ## Current Best Score
 
-**25.09** (7 coins, equal weight, validation set — full run, no timeout). Beat this to keep your change.
+**32.06** (7 coins, equal weight, validation set — full run, no timeout). Beat this to keep your change.
