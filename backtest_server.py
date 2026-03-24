@@ -3,45 +3,32 @@ Resident backtest evaluator. Keeps data hot in memory, reloads strategy on each 
 Eliminates ~2-3s of startup/import/parquet-load overhead per autoresearch iteration.
 
 Usage:
-    uv run backtest_server.py          # Interactive: type 'run' + Enter to backtest
-    echo run | uv run backtest_server.py   # Single-shot mode
+    uv run backtest_server.py              # Start TCP server on port 9877
+    uv run backtest_server.py --port 9878  # Custom port
+    echo run | nc localhost 9877           # Trigger a backtest from another process
 """
 
 import sys
 import time
 import json
-import importlib
+import socket
 import signal as sig
+import argparse
 
 from prepare import load_data, run_backtest, compute_score, TIME_BUDGET
 
-# Load data ONCE on startup
-t_load = time.time()
-data = load_data("val")
-load_time = time.time() - t_load
+DEFAULT_PORT = 9877
 
-total_bars = sum(len(df) for df in data.values())
-print(f"Loaded {total_bars} bars across {len(data)} symbols in {load_time:.1f}s", file=sys.stderr)
-print(f"Symbols: {list(data.keys())}", file=sys.stderr)
-print("Ready. Send 'run' to backtest, 'quit' to exit.", file=sys.stderr)
-sys.stderr.flush()
 
-for line in sys.stdin:
-    cmd = line.strip().lower()
-    if cmd == "quit" or cmd == "exit":
-        break
-    if cmd != "run":
-        continue
-
+def handle_run():
+    """Reload strategy, run backtest, return JSON result."""
     # Reload strategy module (picks up autoresearch edits to strategy.py)
     if "strategy" in sys.modules:
         del sys.modules["strategy"]
     try:
         from strategy import Strategy
     except Exception as e:
-        print(json.dumps({"error": str(e), "score": -999}))
-        sys.stdout.flush()
-        continue
+        return json.dumps({"error": f"import: {e}", "score": -999})
 
     # Set timeout
     def timeout_handler(signum, frame):
@@ -57,7 +44,7 @@ for line in sys.stdin:
         score = compute_score(result)
         elapsed = time.time() - t_start
 
-        print(json.dumps({
+        return json.dumps({
             "score": round(score, 6),
             "sharpe": round(result.sharpe, 6),
             "total_return_pct": round(result.total_return_pct, 6),
@@ -68,12 +55,87 @@ for line in sys.stdin:
             "annual_turnover": round(result.annual_turnover, 2),
             "backtest_seconds": round(result.backtest_seconds, 1),
             "total_seconds": round(elapsed, 1),
-        }))
+        })
     except TimeoutError:
-        print(json.dumps({"error": "timeout", "score": -999}))
+        return json.dumps({"error": "timeout", "score": -999})
     except Exception as e:
-        print(json.dumps({"error": str(e), "score": -999}))
+        return json.dumps({"error": str(e), "score": -999})
     finally:
-        sig.alarm(0)  # Cancel timeout
+        sig.alarm(0)
 
-    sys.stdout.flush()
+
+def main():
+    parser = argparse.ArgumentParser(description="Resident backtest evaluator")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: 9877)")
+    args = parser.parse_args()
+
+    # Load data ONCE on startup
+    t_load = time.time()
+    global data
+    data = load_data("val")
+    load_time = time.time() - t_load
+
+    total_bars = sum(len(df) for df in data.values())
+    print(f"Loaded {total_bars} bars across {len(data)} symbols in {load_time:.1f}s", file=sys.stderr)
+    print(f"Symbols: {list(data.keys())}", file=sys.stderr)
+
+    # Start TCP server
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", args.port))
+    server.listen(1)
+
+    print(f"Listening on 127.0.0.1:{args.port}", file=sys.stderr)
+    print(f"Client: echo run | nc localhost {args.port}", file=sys.stderr)
+    sys.stderr.flush()
+
+    # Handle SIGTERM/SIGINT for clean shutdown
+    def shutdown_handler(signum, frame):
+        print("\nShutting down.", file=sys.stderr)
+        server.close()
+        sys.exit(0)
+
+    sig.signal(sig.SIGTERM, shutdown_handler)
+    sig.signal(sig.SIGINT, shutdown_handler)
+
+    while True:
+        try:
+            conn, addr = server.accept()
+        except OSError:
+            break
+
+        try:
+            raw = conn.recv(1024).decode().strip().lower()
+            if raw == "run":
+                result = handle_run()
+                conn.sendall((result + "\n").encode())
+            elif raw == "ping":
+                conn.sendall(b'{"status": "ok"}\n')
+            else:
+                conn.sendall(b'{"error": "unknown command, send run or ping"}\n')
+        except Exception as e:
+            try:
+                conn.sendall(json.dumps({"error": str(e), "score": -999}).encode() + b"\n")
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+# Also support stdin mode for backwards compatibility
+if __name__ == "__main__":
+    if not sys.stdin.isatty() and len(sys.argv) == 1:
+        # Piped input mode: read from stdin (backwards compat)
+        data = load_data("val")
+        total_bars = sum(len(df) for df in data.values())
+        print(f"Loaded {total_bars} bars across {len(data)} symbols", file=sys.stderr)
+        for line in sys.stdin:
+            cmd = line.strip().lower()
+            if cmd == "quit" or cmd == "exit":
+                break
+            if cmd == "run":
+                result = handle_run()
+                print(result)
+                sys.stdout.flush()
+    else:
+        main()
