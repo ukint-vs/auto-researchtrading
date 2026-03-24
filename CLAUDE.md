@@ -116,4 +116,4 @@ The strategy has pre-built Ehlers DSP methods ready for experimentation. The aut
 
 ## Current Best Score
 
-**24.69** (7 coins, equal weight, validation set). Beat this to keep your change.
+**24.57** (7 coins, equal weight, validation set — full run, no timeout). Beat this to keep your change.

@@ -307,10 +307,24 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
     if not timestamps:
         return BacktestResult()
 
-    # Index data by (symbol, timestamp) for fast lookup
-    indexed = {}
+    # Index data by symbol: sort by timestamp, use positional pointers
+    symbol_dfs = {}
+    symbol_ts = {}  # timestamp arrays for O(1) compare
+    symbol_ptrs = {}
     for symbol, df in data.items():
-        indexed[symbol] = df.set_index("timestamp")
+        sdf = df.sort_values("timestamp").reset_index(drop=True)
+        symbol_dfs[symbol] = sdf
+        symbol_ts[symbol] = sdf["timestamp"].values
+        symbol_ptrs[symbol] = 0
+
+    def _calc_unrealized_pnl(positions, entry_prices, bar_data):
+        pnl = 0.0
+        for sym, pos in positions.items():
+            if sym in bar_data:
+                entry = entry_prices.get(sym, bar_data[sym].close)
+                if entry > 0:
+                    pnl += pos * (bar_data[sym].close - entry) / entry
+        return pnl
 
     # Portfolio state
     portfolio = PortfolioState(
@@ -327,9 +341,6 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
     total_volume = 0.0
     prev_equity = INITIAL_CAPITAL
 
-    # History buffers
-    history_buffers = {symbol: [] for symbol in data}
-
     for ts in timestamps:
         elapsed = time.time() - t_start
         if elapsed > TIME_BUDGET:
@@ -337,30 +348,22 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
 
         portfolio.timestamp = ts
 
-        # Build bar data
+        # Build bar data using pointer iteration + iloc pre-slicing
         bar_data = {}
         for symbol in data:
-            if symbol not in indexed or ts not in indexed[symbol].index:
+            ptr = symbol_ptrs[symbol]
+            ts_arr = symbol_ts[symbol]
+            if ptr >= len(ts_arr):
                 continue
-            row = indexed[symbol].loc[ts]
-            if isinstance(row, pd.DataFrame):
-                row = row.iloc[0]
+            if ts_arr[ptr] != ts:
+                continue
 
-            # Update history buffer
-            bar_dict = {
-                "timestamp": ts,
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-                "volume": row["volume"],
-                "funding_rate": row.get("funding_rate", 0.0),
-            }
-            history_buffers[symbol].append(bar_dict)
-            if len(history_buffers[symbol]) > LOOKBACK_BARS:
-                history_buffers[symbol] = history_buffers[symbol][-LOOKBACK_BARS:]
+            sdf = symbol_dfs[symbol]
+            row = sdf.iloc[ptr]
 
-            hist_df = pd.DataFrame(history_buffers[symbol])
+            # iloc window for history (replaces list-of-dicts + DataFrame construction)
+            start = max(0, ptr - LOOKBACK_BARS + 1)
+            hist_df = sdf.iloc[start:ptr + 1]
 
             bar_data[symbol] = BarData(
                 symbol=symbol,
@@ -370,23 +373,16 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
                 low=row["low"],
                 close=row["close"],
                 volume=row["volume"],
-                funding_rate=row.get("funding_rate", 0.0),
+                funding_rate=row.get("funding_rate", 0.0) if "funding_rate" in sdf.columns else 0.0,
                 history=hist_df,
             )
+            symbol_ptrs[symbol] = ptr + 1
 
         if not bar_data:
             continue
 
         # Update portfolio equity (mark-to-market)
-        unrealized_pnl = 0.0
-        for sym, pos_notional in portfolio.positions.items():
-            if sym in bar_data:
-                current_price = bar_data[sym].close
-                entry_price = portfolio.entry_prices.get(sym, current_price)
-                if entry_price > 0:
-                    price_change = (current_price - entry_price) / entry_price
-                    unrealized_pnl += pos_notional * price_change
-
+        unrealized_pnl = _calc_unrealized_pnl(portfolio.positions, portfolio.entry_prices, bar_data)
         portfolio.equity = portfolio.cash + sum(abs(v) for v in portfolio.positions.values()) + unrealized_pnl
 
         # Apply funding rates (on open positions)
@@ -477,15 +473,7 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
                     trade_log.append(("modify", sig.symbol, delta, exec_price, 0))
 
         # Recalculate equity after trades
-        unrealized_pnl = 0.0
-        for sym, pos_notional in portfolio.positions.items():
-            if sym in bar_data:
-                current_price = bar_data[sym].close
-                entry_price = portfolio.entry_prices.get(sym, current_price)
-                if entry_price > 0:
-                    price_change = (current_price - entry_price) / entry_price
-                    unrealized_pnl += pos_notional * price_change
-
+        unrealized_pnl = _calc_unrealized_pnl(portfolio.positions, portfolio.entry_prices, bar_data)
         current_equity = portfolio.cash + sum(abs(v) for v in portfolio.positions.values()) + unrealized_pnl
         equity_curve.append(current_equity)
 
