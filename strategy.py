@@ -35,7 +35,7 @@ MACD_FAST = 14
 MACD_SLOW = 23
 MACD_SIGNAL = 9
 
-BB_PERIOD = 7
+BB_PERIOD = 5
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
@@ -64,7 +64,7 @@ SDO_OVERSOLD = 20
 SDO_TIGHT_ATR_MULT = 3.5
 
 COOLDOWN_BARS = 2
-MIN_VOTES = 4  # out of 6
+MIN_VOTES = 4  # out of 7
 
 def ema(values, span):
     alpha = 2.0 / (span + 1)
@@ -84,6 +84,52 @@ def calc_rsi(closes, period):
     avg_loss = np.mean(losses)
     rs = avg_gain / max(avg_loss, 1e-10)
     return 100 - 100 / (1 + rs)
+
+
+def aggregate_to_4h(history):
+    """Aggregate 1h bars into 4h bars. Returns dict with OHLCV numpy arrays.
+
+    Groups by 4-hour UTC windows (0:00, 4:00, 8:00, 12:00, 16:00, 20:00).
+    Incomplete trailing window is included (uses available bars).
+    With 500 1h bars → ~125 4h bars.
+    """
+    ts = history["timestamp"].values
+    o = history["open"].values
+    h = history["high"].values
+    l = history["low"].values
+    c = history["close"].values
+    v = history["volume"].values
+    n = len(ts)
+    if n < 4:
+        return {"open": o, "high": h, "low": l, "close": c, "volume": v, "timestamp": ts}
+
+    # Group by 4-hour boundary (ms timestamps)
+    MS_4H = 4 * 3600 * 1000
+    boundaries = ts // MS_4H
+
+    out_o, out_h, out_l, out_c, out_v, out_ts = [], [], [], [], [], []
+    i = 0
+    while i < n:
+        b = boundaries[i]
+        j = i
+        while j < n and boundaries[j] == b:
+            j += 1
+        out_o.append(o[i])
+        out_h.append(np.max(h[i:j]))
+        out_l.append(np.min(l[i:j]))
+        out_c.append(c[j - 1])
+        out_v.append(np.sum(v[i:j]))
+        out_ts.append(ts[i])
+        i = j
+
+    return {
+        "open": np.array(out_o),
+        "high": np.array(out_h),
+        "low": np.array(out_l),
+        "close": np.array(out_c),
+        "volume": np.array(out_v),
+        "timestamp": np.array(out_ts),
+    }
 
 
 class Strategy:
@@ -339,8 +385,21 @@ class Strategy:
             bb_pctile = self._calc_bb_width_pctile(closes, BB_PERIOD)
             bb_compressed = bb_pctile < 90  # Below 40th percentile = compressed
 
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed])
+            # RSI divergence as 7th additive signal
+            _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes, RSI_PERIOD, 14)
+
+            # 4h momentum signal (higher timeframe confirmation)
+            bars_4h = aggregate_to_4h(bd.history)
+            c4h = bars_4h["close"]
+            htf_bull = False
+            htf_bear = False
+            if len(c4h) >= 4:
+                ret_4h = (c4h[-1] - c4h[-3]) / c4h[-3]
+                htf_bull = ret_4h > dyn_threshold
+                htf_bear = ret_4h < -dyn_threshold
+
+            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div, htf_bull])
+            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div, htf_bear])
 
             btc_confirm = True
             if symbol != "BTC":
