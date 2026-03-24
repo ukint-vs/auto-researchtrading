@@ -90,6 +90,15 @@ SDO_OVERBOUGHT = 80
 SDO_OVERSOLD = 20
 SDO_TIGHT_ATR_MULT = 3.5
 
+# Higher timeframe indicator params (used with aggregate_tf)
+HTF_PERIOD = 4            # hours per bar (4, 12, or 24)
+HTF_EMA_FAST = 5          # 4h EMA fast period (~20h lookback)
+HTF_EMA_SLOW = 13         # 4h EMA slow period (~52h lookback)
+HTF_RSI_PERIOD = 8        # 4h RSI period
+HTF_RSI_OVERBOUGHT = 70   # skip entries above this
+HTF_RSI_OVERSOLD = 30     # skip entries below this
+HTF_TREND_LOOKBACK = 6    # bars for momentum (6 × 4h = 24h)
+
 COOLDOWN_BARS = 2
 MIN_VOTES = 4  # out of 7
 
