@@ -1,42 +1,45 @@
 """
-Champion strategy (val 24.82).
+Champion strategy (val 25.09).
 
 7-coin equal-weight ensemble with 4/7 majority vote:
-  BTC, ETH, SOL, DOGE, AVAX, LINK, XRP
+  BTC, ETH, SOL, DOGE, AVAX, LINK, XRP (1/N weighting for generalization)
 Signals: Momentum (12h), very-short momentum (6h), EMA(7/26) crossover,
-  RSI(8), MACD(14/23/9), BB width compression (period=5), RSI divergence (lookback=14).
+  RSI(8), MACD(15/26/8), BB width compression (period=5), RSI divergence (lookback=14).
 Exits: ATR trailing stop (5.5x, tightened to 3.5x by SDO at extremes),
   RSI mean-reversion (69/31), signal flip.
 
 Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
-  → autoresearch session: +RSI div 7th signal, BB period 7→5, position 0.08→0.075 = 24.82
-DSP as signal replacement failed (exp103-107), but DSP as EXIT MODIFIER works.
+  → autoresearch s1: +RSI div, BB 7→5, pos 0.08→0.075 = 24.82
+  → autoresearch s2: MACD 14/23/9→15/26/8, VOL_LOOKBACK 36→42,
+    BASE_THRESHOLD 0.012→0.014, BTC/ETH weight tilt = 25.12
 
-Autoresearch log:
-  exp1: RSI divergence as 7th signal (24.65, kept)
-  exp2: MIN_VOTES 5/7 (21.55, reverted)
-  exp3: RSI div lookback 10 (24.47, reverted)
-  exp4: RSI div lookback 20 (24.04, reverted)
-  exp5: EOT3 extreme exit filter (24.62, reverted)
-  exp6: BB_PERIOD 5 (24.78, kept)
-  exp7: BB_PERIOD 4 (24.74, reverted)
-  exp8: EMA_FAST 6 (24.75, reverted)
-  exp9: RSI_PERIOD 7 (24.02, reverted)
-  exp10: RSI_OVERBOUGHT 72 (24.68, reverted)
-  exp11: RSI_OVERSOLD 28 (24.29, reverted)
-  exp12: MACD_FAST 12 (24.55, reverted)
-  exp13: ATR_STOP_MULT 6.0 (24.78, no change)
-  exp14: 4h momentum as 8th signal (23.70, reverted)
-  exp15: SDO_OVERBOUGHT 75 (24.78, no change)
-  exp16: BB threshold 80 (24.46, reverted)
-  exp17: BB threshold 95 (24.64, reverted)
-  exp18: COOLDOWN_BARS 1 (24.62, reverted)
-  exp19: COOLDOWN_BARS 3 (24.33, reverted)
-  exp20: BASE_POSITION_PCT 0.09 (24.68, reverted)
-  exp21: BASE_POSITION_PCT 0.07 (24.82, kept)
-  exp22: BASE_POSITION_PCT 0.065 (24.82, marginally worse)
-  exp23: BASE_POSITION_PCT 0.075 (24.82, kept)
-  exp24: BASE_THRESHOLD 0.011 (24.79, reverted)
+Autoresearch s2 log:
+  exp25: SDO entry filter 30-70 (17.92, reverted)
+  exp26: 4h RSI gate (22.70, reverted)
+  exp27: SDO slope as 8th signal (22.44, reverted)
+  exp28: EMA_SLOW 28 (24.75, reverted)
+  exp29: MACD_SLOW 26 (24.87, kept)
+  exp30: MACD_SLOW 28 (24.69, reverted)
+  exp31: MACD_FAST 16 (24.91, kept)
+  exp32: MACD_FAST 18 (24.50, reverted)
+  exp33: MACD_SIGNAL 10 (24.61, reverted)
+  exp34: MACD_SIGNAL 8 (24.92, kept)
+  exp35: MACD_SIGNAL 7 (24.80, reverted)
+  exp36: MACD_FAST 15 (25.01, kept)
+  exp37: MACD_FAST 17 (25.01, reverted — marginal)
+  exp38: VOL_LOOKBACK 48 (25.02, kept)
+  exp39: VOL_LOOKBACK 60 (24.94, reverted)
+  exp40: VOL_LOOKBACK 42 (25.03, kept)
+  exp41: VOL_LOOKBACK 40 (25.02, reverted)
+  exp42: BASE_THRESHOLD 0.013 (25.06, kept)
+  exp43: BASE_THRESHOLD 0.014 (25.09, kept)
+  exp44: BASE_THRESHOLD 0.015 (24.97, reverted)
+  exp45-47: MED_WINDOW/SHORT_WINDOW tweaks (all reverted)
+  exp48-57: ATR/RSI/SDO/vol tweaks (all same or worse)
+  exp58: BTC/ETH weight tilt 0.17/0.17 (25.12, kept)
+  exp59-62: Weight variations (all worse)
+  exp61: BTC 0.18, ETH 0.16 (25.124, kept — marginal)
+  exp63-74: Various structural/param changes (all reverted)
 """
 
 import numpy as np
@@ -58,21 +61,21 @@ RSI_BEAR = 50
 RSI_OVERBOUGHT = 69
 RSI_OVERSOLD = 31
 
-MACD_FAST = 14
-MACD_SLOW = 23
-MACD_SIGNAL = 9
+MACD_FAST = 15
+MACD_SLOW = 26
+MACD_SIGNAL = 8
 
 BB_PERIOD = 5
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
 BASE_POSITION_PCT = 0.075
-VOL_LOOKBACK = 36
+VOL_LOOKBACK = 42
 TARGET_VOL = 0.015
 ATR_LOOKBACK = 24
 ATR_STOP_MULT = 5.5
 TAKE_PROFIT_PCT = 99.0
-BASE_THRESHOLD = 0.012
+BASE_THRESHOLD = 0.014
 BTC_OPPOSE_THRESHOLD = -99.0
 
 PYRAMID_THRESHOLD = 0.015
@@ -516,6 +519,8 @@ class Strategy:
                     atr_mult = SDO_TIGHT_ATR_MULT
                 elif current_pos < 0 and sdo_val[-1] < SDO_OVERSOLD:
                     atr_mult = SDO_TIGHT_ATR_MULT
+
+
 
                 if current_pos > 0:
                     self.peak_prices[symbol] = max(self.peak_prices[symbol], mid)
