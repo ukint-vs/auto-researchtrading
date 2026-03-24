@@ -114,6 +114,25 @@ The strategy has pre-built Ehlers DSP methods ready for experimentation. The aut
 
 **Key insight:** Direct signal replacement scored worse. Try DSP as FILTERS, EXIT modifiers, or ADDITIVE signals with lower MIN_VOTES thresholds instead.
 
+## Multi-Timeframe (4h) Building Block
+
+`aggregate_to_4h(bd.history)` converts the 1h history DataFrame into 4h OHLCV arrays (dict with numpy arrays: open, high, low, close, volume, timestamp). With 500 1h bars → ~125 4h bars.
+
+**Usage in on_bar:**
+```python
+bars_4h = aggregate_to_4h(bd.history)
+closes_4h = bars_4h["close"]
+ema_4h = ema(closes_4h[-20:], 7)  # 4h EMA
+rsi_4h = calc_rsi(closes_4h, 8)    # 4h RSI
+```
+
+**Experiment ideas:**
+1. Use 4h EMA trend as a higher-TF filter (only enter 1h longs when 4h EMA is bullish)
+2. Use 4h RSI as an overbought/oversold gate (skip entries when 4h RSI > 70 or < 30)
+3. Use 4h ATR for position sizing (bigger TF volatility → smaller size)
+4. Use 4h momentum (4h close vs 6-bar-ago close) as a macro trend confirm
+5. Use 4h BB width compression as a breakout detector (lower noise than 1h)
+
 ## Current Best Score
 
 **24.57** (7 coins, equal weight, validation set — full run, no timeout). Beat this to keep your change.
