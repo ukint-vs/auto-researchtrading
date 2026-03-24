@@ -33,7 +33,8 @@ MAX_LEVERAGE = 20              # max leverage allowed
 LOOKBACK_BARS = 500            # history buffer provided to strategy
 BAR_INTERVAL = "1h"
 
-SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
+DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
+SYMBOLS = DEFAULT_SYMBOLS  # backward compat alias
 
 # Date splits (UTC timestamps)
 TRAIN_START = "2023-06-01"
@@ -51,6 +52,184 @@ HOURS_PER_YEAR = 8760
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autotrader")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
+UNIVERSE_CACHE = os.path.join(CACHE_DIR, "coin_universe.json")
+
+# Universe discovery constants
+MIN_DAILY_VOLUME_USD = 1_000_000
+PIPELINE_SIZE = 20
+TRAINING_SIZE = 10
+STABLECOINS = {"USDC", "USDT", "DAI", "TUSD", "BUSD", "FRAX", "LUSD", "USDP", "PYUSD", "FDUSD", "USD"}
+CAP_TIERS = {
+    "BTC": 1, "ETH": 1,
+    "SOL": 2, "XRP": 2, "DOGE": 2, "ADA": 2, "AVAX": 2, "LINK": 2,
+    "BNB": 2, "TRX": 2, "DOT": 2, "MATIC": 2, "POL": 2, "SHIB": 2,
+    "LTC": 2, "UNI": 2, "BCH": 2, "NEAR": 2, "APT": 2, "FIL": 2,
+    "ICP": 2, "ATOM": 2, "ARB": 2, "OP": 2, "SUI": 2, "SEI": 2,
+}
+TRAINING_TIER_MIN = {1: 2, 2: 3}  # min coins per tier in training set
+
+# ---------------------------------------------------------------------------
+# Universe discovery
+# ---------------------------------------------------------------------------
+
+import json
+from datetime import datetime
+
+
+def discover_coins(top_n=PIPELINE_SIZE):
+    """Query Hyperliquid for top perp markets ranked by volume + OI.
+
+    Returns dict with pipeline (all top_n), training (diverse subset),
+    tiers mapping, and a version string for reproducibility.
+    """
+    hl_url = "https://api.hyperliquid.xyz/info"
+    try:
+        resp = requests.post(hl_url, json={"type": "metaAndAssetCtxs"}, timeout=30)
+        resp.raise_for_status()
+        meta, asset_ctxs = resp.json()
+    except Exception as e:
+        print(f"  Warning: Hyperliquid API failed ({e}), using default symbols")
+        return _default_universe()
+
+    # Parse market data
+    coins = []
+    for i, ctx in enumerate(asset_ctxs):
+        try:
+            name = meta["universe"][i]["name"]
+            volume = float(ctx.get("dayNtlVlm", 0))
+            oi = float(ctx.get("openInterest", 0))
+            coins.append({"name": name, "volume": volume, "oi": oi})
+        except (KeyError, IndexError, ValueError):
+            continue
+
+    # Filter stablecoins and low-volume
+    coins = [c for c in coins if c["name"] not in STABLECOINS and c["volume"] >= MIN_DAILY_VOLUME_USD]
+
+    if not coins:
+        print("  Warning: all coins filtered out, using default symbols")
+        return _default_universe()
+
+    # Rank by composite score: 60% volume + 40% OI
+    coins.sort(key=lambda c: c["volume"], reverse=True)
+    for rank, c in enumerate(coins):
+        c["vol_rank"] = rank
+    coins.sort(key=lambda c: c["oi"], reverse=True)
+    for rank, c in enumerate(coins):
+        c["oi_rank"] = rank
+    coins.sort(key=lambda c: 0.6 * c["vol_rank"] + 0.4 * c["oi_rank"])
+
+    pipeline = [c["name"] for c in coins[:top_n]]
+
+    # Select diverse training subset
+    training = _select_training_subset(pipeline)
+
+    version = f"v1-{datetime.utcnow().strftime('%Y%m%d')}"
+    tiers = {sym: CAP_TIERS.get(sym, 3) for sym in pipeline}
+
+    return {"pipeline": pipeline, "training": training, "tiers": tiers, "version": version}
+
+
+def _select_training_subset(pipeline):
+    """Select TRAINING_SIZE coins from pipeline ensuring tier diversity."""
+    selected = []
+    remaining = list(pipeline)
+
+    # Ensure BTC and ETH are always included (tier 1 anchors)
+    for sym in ["BTC", "ETH"]:
+        if sym in remaining:
+            selected.append(sym)
+            remaining.remove(sym)
+
+    # Fill tier minimums
+    for tier, min_count in sorted(TRAINING_TIER_MIN.items()):
+        current = sum(1 for s in selected if CAP_TIERS.get(s, 3) == tier)
+        for sym in list(remaining):
+            if current >= min_count:
+                break
+            if CAP_TIERS.get(sym, 3) == tier:
+                selected.append(sym)
+                remaining.remove(sym)
+                current += 1
+
+    # Fill rest by rank order
+    for sym in remaining:
+        if len(selected) >= TRAINING_SIZE:
+            break
+        selected.append(sym)
+
+    return selected[:TRAINING_SIZE]
+
+
+def _default_universe():
+    """Return a universe dict based on DEFAULT_SYMBOLS (fallback)."""
+    tiers = {sym: CAP_TIERS.get(sym, 3) for sym in DEFAULT_SYMBOLS}
+    return {
+        "pipeline": list(DEFAULT_SYMBOLS),
+        "training": list(DEFAULT_SYMBOLS),
+        "tiers": tiers,
+        "version": "v0-default",
+    }
+
+
+def get_symbols(subset="training"):
+    """Load symbols from cached universe. Falls back to DEFAULT_SYMBOLS.
+
+    When subset="training", returns only symbols that have valid data
+    for the validation split (>= 1000 bars, no extreme price ratios).
+    """
+    if os.path.exists(UNIVERSE_CACHE):
+        try:
+            with open(UNIVERSE_CACHE) as f:
+                universe = json.load(f)
+            symbols = universe.get(subset, DEFAULT_SYMBOLS)
+            if symbols:
+                if subset == "training":
+                    return _validate_symbols(symbols, "val")
+                return symbols
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return list(DEFAULT_SYMBOLS)
+
+
+def _validate_symbols(symbols, split="val"):
+    """Filter symbols to only those with valid data for the given split."""
+    splits = {
+        "train": (TRAIN_START, TRAIN_END),
+        "val": (VAL_START, VAL_END),
+        "test": (TEST_START, TEST_END),
+    }
+    if split not in splits:
+        return symbols
+    start_str, end_str = splits[split]
+    start_ms = int(pd.Timestamp(start_str, tz="UTC").timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end_str, tz="UTC").timestamp() * 1000)
+
+    valid = []
+    for symbol in symbols:
+        filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
+        if not os.path.exists(filepath):
+            continue
+        df = pd.read_parquet(filepath)
+        mask = (df["timestamp"] >= start_ms) & (df["timestamp"] < end_ms)
+        split_df = df[mask].reset_index(drop=True)
+        split_df = split_df[split_df["close"] > 0].reset_index(drop=True)
+        if len(split_df) < 1000:
+            continue
+        price_ratio = split_df["close"].max() / split_df["close"].min()
+        if price_ratio > 1000:
+            continue
+        valid.append(symbol)
+    return valid if valid else list(DEFAULT_SYMBOLS)
+
+
+def save_universe(universe):
+    """Save discovered universe to cache file."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    universe["timestamp"] = datetime.utcnow().isoformat()
+    with open(UNIVERSE_CACHE, "w") as f:
+        json.dump(universe, f, indent=2)
+    print(f"  Universe saved to {UNIVERSE_CACHE} (version: {universe['version']})")
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -221,19 +400,20 @@ def download_data(symbols=None):
     """Download historical OHLCV + funding data for all symbols."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if symbols is None:
-        symbols = SYMBOLS
+        symbols = get_symbols("pipeline")
 
     start_ms = int(pd.Timestamp(TRAIN_START, tz="UTC").timestamp() * 1000)
     end_ms = int(pd.Timestamp(TEST_END, tz="UTC").timestamp() * 1000)
 
-    for symbol in symbols:
+    total = len(symbols)
+    for idx, symbol in enumerate(symbols, 1):
         filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
         if os.path.exists(filepath):
             existing = pd.read_parquet(filepath)
-            print(f"  {symbol}: already have {len(existing)} bars")
+            print(f"  [{idx}/{total}] {symbol}: already have {len(existing)} bars")
             continue
 
-        print(f"  {symbol}: downloading candles from CryptoCompare...")
+        print(f"  [{idx}/{total}] {symbol}: downloading candles from CryptoCompare...")
 
         # Use CryptoCompare for reliable historical OHLCV (no geo-restrictions)
         df = _download_cryptocompare_candles(symbol, start_ms, end_ms)
@@ -263,8 +443,13 @@ def download_data(symbols=None):
         print(f"  {symbol}: saved {len(df)} bars to {filepath}")
 
 
-def load_data(split: str = "val") -> dict:
-    """Load OHLCV+funding data for the given split. Returns {symbol: DataFrame}."""
+def load_data(split: str = "val", symbols=None) -> dict:
+    """Load OHLCV+funding data for the given split. Returns {symbol: DataFrame}.
+
+    Args:
+        split: "train", "val", or "test"
+        symbols: list of symbols to load. Defaults to get_symbols("training").
+    """
     splits = {
         "train": (TRAIN_START, TRAIN_END),
         "val": (VAL_START, VAL_END),
@@ -275,16 +460,30 @@ def load_data(split: str = "val") -> dict:
     start_ms = int(pd.Timestamp(start_str, tz="UTC").timestamp() * 1000)
     end_ms = int(pd.Timestamp(end_str, tz="UTC").timestamp() * 1000)
 
+    if symbols is None:
+        symbols = get_symbols("training")
+
     result = {}
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
         if not os.path.exists(filepath):
             continue
         df = pd.read_parquet(filepath)
         mask = (df["timestamp"] >= start_ms) & (df["timestamp"] < end_ms)
         split_df = df[mask].reset_index(drop=True)
+        # Filter out zero-price bars (CryptoCompare returns 0s before coin existed)
+        split_df = split_df[split_df["close"] > 0].reset_index(drop=True)
+        # Reject coins with extreme price ratio (bad data or pre-launch artifacts)
         if len(split_df) > 0:
-            result[symbol] = split_df
+            price_ratio = split_df["close"].max() / split_df["close"].min()
+            if price_ratio > 1000:
+                print(f"  Warning: {symbol} has extreme price ratio ({price_ratio:.0f}x) in {split} split, excluding")
+                continue
+        if len(split_df) < 1000:
+            if len(split_df) > 0:
+                print(f"  Warning: {symbol} has only {len(split_df)} bars in {split} split, excluding")
+            continue
+        result[symbol] = split_df
     return result
 
 # ---------------------------------------------------------------------------
@@ -581,11 +780,47 @@ def compute_score(result: BacktestResult) -> float:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data for autotrader")
-    parser.add_argument("--symbols", nargs="+", default=None, help="Symbols to download (default: all)")
+    parser.add_argument("--symbols", nargs="+", default=None, help="Symbols to download (default: pipeline)")
+    parser.add_argument("--discover", action="store_true", help="Print discovered universe and exit")
+    parser.add_argument("--refresh", action="store_true", help="Force re-discovery (ignore cache)")
+    parser.add_argument("--info", action="store_true", help="Show data completeness per symbol")
     args = parser.parse_args()
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
+
+    if args.discover or args.refresh:
+        print("Discovering coins from Hyperliquid...")
+        universe = discover_coins()
+        save_universe(universe)
+        print(f"\n  Version:  {universe['version']}")
+        print(f"  Pipeline ({len(universe['pipeline'])} coins): {', '.join(universe['pipeline'])}")
+        print(f"  Training ({len(universe['training'])} coins): {', '.join(universe['training'])}")
+        print(f"\n  Tier breakdown:")
+        for tier in [1, 2, 3]:
+            tier_coins = [s for s in universe["pipeline"] if universe["tiers"].get(s, 3) == tier]
+            if tier_coins:
+                print(f"    Tier {tier}: {', '.join(tier_coins)}")
+        if args.discover:
+            sys.exit(0)
+        print()
+
+    if args.info:
+        symbols = args.symbols or get_symbols("pipeline")
+        for split_name in ["train", "val", "test"]:
+            data = load_data(split_name, symbols=symbols)
+            total_bars = sum(len(df) for df in data.values())
+            print(f"  {split_name}: {len(data)} symbols, {total_bars} total bars")
+            for sym in symbols:
+                if sym in data:
+                    print(f"    {sym}: {len(data[sym])} bars")
+                else:
+                    filepath = os.path.join(DATA_DIR, f"{sym}_1h.parquet")
+                    if not os.path.exists(filepath):
+                        print(f"    {sym}: no data file")
+                    else:
+                        print(f"    {sym}: excluded (< 1000 bars)")
+        sys.exit(0)
 
     print("Downloading data...")
     download_data(args.symbols)

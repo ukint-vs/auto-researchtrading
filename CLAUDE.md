@@ -11,9 +11,12 @@ This project uses OpenWolf for context management. Read and follow .wolf/OPENWOL
 ## Commands
 
 ```bash
-uv run prepare.py              # Download data (one-time, cached to ~/.cache/autotrader/data/)
+uv run prepare.py              # Download data for pipeline coins (cached to ~/.cache/autotrader/data/)
 uv run prepare.py --symbols BTC ETH  # Download specific symbols only
-uv run backtest.py             # Run strategy.py against validation data, prints score
+uv run prepare.py --discover   # Print discovered universe from Hyperliquid and exit
+uv run prepare.py --refresh    # Force re-discovery (ignore cache) then download
+uv run prepare.py --info       # Show data completeness per symbol per split
+uv run backtest.py             # Run strategy.py against validation data, prints dual scores
 uv run run_benchmarks.py       # Run all 5 benchmark strategies, print leaderboard
 uv run export_equity.py        # Export equity curve to equity_curve.csv
 uv run export_milestones.py    # Export equity curves at key autoresearch milestones
@@ -24,9 +27,9 @@ Dependencies: numpy, pandas, scipy, requests, pyarrow (managed by uv via pyproje
 
 ## Architecture
 
-**Immutable scaffold** (do not modify):
-- `prepare.py` — Data download (CryptoCompare OHLCV + Hyperliquid funding rates), backtest engine, scoring formula
-- `backtest.py` — Entry point: loads data via prepare.py, instantiates Strategy, runs backtest
+**Scaffold** (do not modify during autoresearch):
+- `prepare.py` — Data download, coin discovery, backtest engine, scoring formula
+- `backtest.py` — Entry point: loads data via prepare.py, instantiates Strategy, runs backtest (dual scoreboard)
 - `benchmarks/` — 5 reference strategies for comparison
 
 **Mutable** (the only file to edit for strategy work):
@@ -34,6 +37,10 @@ Dependencies: numpy, pandas, scipy, requests, pyarrow (managed by uv via pyproje
 
 **Data flow:**
 ```
+Hyperliquid metaAndAssetCtxs API → discover_coins() → coin_universe.json (versioned)
+  → get_symbols("pipeline") → 20 coins for download
+  → get_symbols("training") → validated subset for backtest (data quality filtered)
+
 CryptoCompare + Hyperliquid APIs → Parquet (~/.cache/autotrader/data/{SYMBOL}_1h.parquet)
   → 500-bar history buffer per symbol per hour
   → Strategy.on_bar(bar_data, portfolio) → list[Signal(symbol, target_position_usd)]
@@ -66,7 +73,7 @@ turnover_penalty = max(0, annual_turnover/capital - 500) × 0.001
 - No new dependencies beyond numpy, pandas, scipy, requests, pyarrow, stdlib
 - 120-second backtest time budget per run
 - Max leverage: 20x
-- Data: BTC, ETH, SOL, DOGE, AVAX, LINK, XRP hourly bars; validation period Jul 2024 – Mar 2025; $100k initial capital
+- Data: auto-discovered from Hyperliquid (run `uv run prepare.py --discover`); hourly bars; validation period Jul 2024 – Mar 2025; $100k initial capital
 - Funding rates applied every 8 hours, scaled to hourly (fr / 8.0); longs pay positive funding
 
 ## Autonomous Experiment Loop
@@ -155,4 +162,6 @@ rsi_4h = calc_rsi(closes_4h, 8)    # 4h RSI
 
 ## Current Best Score
 
-**25.09** (7 coins, equal weight, validation set — full run, no timeout). Beat this to keep your change.
+**22.09** (6 coins, expanded universe, validation set — full run, no timeout). Beat this to keep your change.
+Legacy reference: 25.09 (7 coins, original universe)
+BASELINE RESET: expanded from 7 to 6 validated coins on 2026-03-24. Coins: BTC, ETH, XRP, DOGE, SOL, FARTCOIN.

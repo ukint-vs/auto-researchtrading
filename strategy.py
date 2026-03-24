@@ -1,8 +1,8 @@
 """
-Champion strategy (val 25.09).
+Champion strategy (val 22.09 expanded, legacy 25.09).
 
-7-coin equal-weight ensemble with 4/7 majority vote:
-  BTC, ETH, SOL, DOGE, AVAX, LINK, XRP (1/N weighting for generalization)
+N-coin equal-weight ensemble with 4/7 majority vote:
+  Dynamic symbols from get_symbols("training") with 1/N weighting.
 Signals: Momentum (12h), very-short momentum (6h), EMA(7/26) crossover,
   RSI(8), MACD(15/26/8), BB width compression (period=5), RSI divergence (lookback=14).
 Exits: ATR trailing stop (5.5x, tightened to 3.5x by SDO at extremes),
@@ -44,10 +44,7 @@ Autoresearch s2 log:
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-from prepare import Signal, PortfolioState, BarData
-
-ACTIVE_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
-SYMBOL_WEIGHTS = {"BTC": 0.143, "ETH": 0.143, "SOL": 0.143, "DOGE": 0.143, "AVAX": 0.143, "LINK": 0.143, "XRP": 0.143}
+from prepare import Signal, PortfolioState, BarData, get_symbols
 
 SHORT_WINDOW = 6
 MED_WINDOW = 12
@@ -191,6 +188,8 @@ def aggregate_to_4h(history):
 
 class Strategy:
     def __init__(self):
+        self._symbols = get_symbols("training")
+        self._weight = 1.0 / len(self._symbols) if self._symbols else 1.0
         self.entry_prices = {}
         self.peak_prices = {}
         self.atr_at_entry = {}
@@ -401,7 +400,7 @@ class Strategy:
         btc_eth_corr = self._calc_correlation(bar_data)
         high_corr = btc_eth_corr > HIGH_CORR_THRESHOLD
 
-        for symbol in ACTIVE_SYMBOLS:
+        for symbol in self._symbols:
             if symbol not in bar_data:
                 continue
             bd = bar_data[symbol]
@@ -462,9 +461,7 @@ class Strategy:
             in_cooldown = (self.bar_count - self.exit_bar.get(symbol, -999)) < COOLDOWN_BARS
 
             vol_scale = 1.0
-            weight = SYMBOL_WEIGHTS.get(symbol, 0.33)
-            if high_corr and symbol == "SOL":
-                weight *= 0.5
+            weight = self._weight
             mom_strength = abs(ret_short) / dyn_threshold
             strength_scale = 1.0
             size = equity * BASE_POSITION_PCT * weight * vol_scale * strength_scale * dd_scale
