@@ -131,20 +131,22 @@ class Strategy:
 
     def _calc_bb_width_pctile(self, closes, period):
         """Calculate current BB width percentile over lookback."""
+        from numpy.lib.stride_tricks import sliding_window_view
         if len(closes) < period * 3:
             return 50.0
-        c = pd.Series(closes)
-        sma = c.rolling(period).mean()
-        std = c.rolling(period).std(ddof=0)
-        all_widths = (2 * std / sma)
-        # Match original loop: starts at i=period*2 (rolling idx period*2-1),
-        # ends at i=len-1 (rolling idx len-2). Original excludes current bar.
-        widths = all_widths.iloc[period * 2 - 1 : len(closes) - 1].dropna()
+        # Rolling mean/std via sliding window (pure numpy, no pandas)
+        windows = sliding_window_view(closes, period)
+        sma = windows.mean(axis=1)
+        std = np.sqrt(((windows - sma[:, None]) ** 2).mean(axis=1))  # ddof=0
+        all_widths = np.where(sma > 0, 2 * std / sma, 0.0)
+        # Match original loop: starts at i=period*2, ends at i=len-1
+        # SWV index j uses closes[j:j+period], original at i uses closes[i-period:i]
+        # So j = i - period. i=period*2 → j=period, i=len-1 → j=len-1-period
+        widths = all_widths[period:len(closes) - period]
         if len(widths) < 2:
             return 50.0
-        current_width = widths.iloc[-1]
-        pctile = 100.0 * (widths <= current_width).sum() / len(widths)
-        return pctile
+        current_width = widths[-1]
+        return 100.0 * np.sum(widths <= current_width) / len(widths)
 
     def _ehlers_eot(self, closes, lpperiod, k1, k2):
         """Ehlers Even-Better Trigonometric Oscillator.
@@ -198,30 +200,36 @@ class Strategy:
 
     def _calc_sdo(self, highs, lows, closes, stoch_len=14, donch_len=20, smooth_len=3):
         """Stochastic-Donchian Oscillator. Returns (sdo_smooth, signal_line)."""
+        from numpy.lib.stride_tricks import sliding_window_view
         n = len(closes)
         start = max(stoch_len, donch_len)
         if n <= start:
             return np.full(n, 50.0), np.full(n, 50.0)
 
-        h = pd.Series(highs)
-        l = pd.Series(lows)
-        c = pd.Series(closes)
-
-        # Stochastic component (rolling max/min over stoch_len)
-        hh_s = h.rolling(stoch_len).max()
-        ll_s = l.rolling(stoch_len).min()
+        # Stochastic: rolling max/min over stoch_len (pure numpy)
+        h_win = sliding_window_view(highs, stoch_len)
+        l_win = sliding_window_view(lows, stoch_len)
+        hh_s = h_win.max(axis=1)
+        ll_s = l_win.min(axis=1)
         rng_s = hh_s - ll_s
-        stoch = ((c - ll_s) / rng_s * 100).where(rng_s > 1e-10, 50.0)
+        c_s = closes[stoch_len - 1:]
+        stoch = np.where(rng_s > 1e-10, (c_s - ll_s) / rng_s * 100, 50.0)
 
-        # Donchian component (rolling max/min over donch_len)
-        hh_d = h.rolling(donch_len).max()
-        ll_d = l.rolling(donch_len).min()
+        # Donchian: rolling max/min over donch_len (pure numpy)
+        h_win_d = sliding_window_view(highs, donch_len)
+        l_win_d = sliding_window_view(lows, donch_len)
+        hh_d = h_win_d.max(axis=1)
+        ll_d = l_win_d.min(axis=1)
         rng_d = hh_d - ll_d
         mid_d = (hh_d + ll_d) / 2
-        donch = ((c - mid_d) / rng_d * 100).where(rng_d > 1e-10, 0.0)
+        c_d = closes[donch_len - 1:]
+        donch = np.where(rng_d > 1e-10, (c_d - mid_d) / rng_d * 100, 0.0)
 
+        # Combine: align to start index
         sdo_raw = np.full(n, 50.0)
-        sdo_raw[start:] = (0.5 * stoch.values[start:] + 0.5 * donch.values[start:])
+        s_offset = start - (stoch_len - 1)
+        d_offset = start - (donch_len - 1)
+        sdo_raw[start:] = 0.5 * stoch[s_offset:] + 0.5 * donch[d_offset:]
 
         # Simple moving average smooth
         kernel = np.ones(smooth_len) / smooth_len
@@ -388,9 +396,10 @@ class Strategy:
                     self.peak_prices[symbol] = mid
 
                 # SDO-adaptive ATR stop: tighten when SDO at extremes
-                highs_h = bd.history["high"].values
-                lows_h = bd.history["low"].values
-                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes)
+                sdo_len = 50  # 20 warmup + 3 SMA + 9 EMA signal + margin
+                highs_h = bd.history["high"].values[-sdo_len:]
+                lows_h = bd.history["low"].values[-sdo_len:]
+                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes[-sdo_len:])
                 atr_mult = ATR_STOP_MULT
                 if current_pos > 0 and sdo_val[-1] > 80:
                     atr_mult = 3.5  # tighten stop when overbought
