@@ -33,7 +33,7 @@ MAX_LEVERAGE = 20              # max leverage allowed
 LOOKBACK_BARS = 500            # history buffer provided to strategy
 BAR_INTERVAL = "1h"
 
-SYMBOLS = ["BTC", "ETH", "SOL"]
+SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
 
 # Date splits (UTC timestamps)
 TRAIN_START = "2023-06-01"
