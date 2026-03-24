@@ -33,19 +33,22 @@ from prepare import (
 
 DEFAULT_PORT = 9877
 
-# Global data — loaded once, shared via fork to worker processes
+# Global data — loaded once in parent, passed to workers via initializer
 data = None
 
+# Per-worker data (set by _worker_data_init in each spawned worker)
+_worker_data = None
 
-def _worker_init():
-    """Reset signal handlers in forked workers so they don't inherit server's SIGTERM/SIGINT."""
-    sig.signal(sig.SIGTERM, sig.SIG_DFL)
-    sig.signal(sig.SIGINT, sig.SIG_IGN)
+
+def _worker_data_init(shared_data):
+    """Initializer for Pool workers: store data once per worker, not per task."""
+    global _worker_data
+    _worker_data = shared_data
 
 
 def _run_variant(args):
     """Worker function: exec strategy code, run backtest, return result dict."""
-    variant_id, strategy_code, worker_data = args
+    variant_id, strategy_code = args
     namespace = {
         "np": np,
         "sliding_window_view": sliding_window_view,
@@ -59,7 +62,7 @@ def _run_variant(args):
             return {"variant_id": variant_id, "score": -999,
                     "error_type": "runtime", "error": "No Strategy class defined"}
         strategy = namespace["Strategy"]()
-        result = run_backtest(strategy, worker_data)
+        result = run_backtest(strategy, _worker_data)
         score = compute_score(result)
         return {
             "variant_id": variant_id,
@@ -80,6 +83,9 @@ def _run_variant(args):
                 "error_type": "runtime", "error": str(e)}
 
 
+WORKER_TIMEOUT = TIME_BUDGET + 30  # 150s per worker (120s budget + 30s grace)
+
+
 def handle_batch(batch_json):
     """Run N strategy variants in parallel, return sorted results."""
     try:
@@ -92,12 +98,15 @@ def handle_batch(batch_json):
         return json.dumps([])
 
     workers = min(len(variants), os.cpu_count() or 4, 8)
-    work = [(v["id"], v["code"], data) for v in variants]
+    work = [(v["id"], v["code"]) for v in variants]
 
     try:
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=workers) as pool:
-            results = pool.map(_run_variant, work)
+        with ctx.Pool(processes=workers, initializer=_worker_data_init, initargs=(data,)) as pool:
+            async_result = pool.map_async(_run_variant, work)
+            results = async_result.get(timeout=WORKER_TIMEOUT)
+    except multiprocessing.TimeoutError:
+        return json.dumps({"error": f"batch timed out after {WORKER_TIMEOUT}s"})
     except Exception as e:
         return json.dumps({"error": f"pool: {e}"})
 
