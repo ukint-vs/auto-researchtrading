@@ -44,7 +44,8 @@ print(f"annual_turnover:    {result.annual_turnover:.2f}")
 print(f"backtest_seconds:   {result.backtest_seconds:.1f}")
 print(f"total_seconds:      {t_end - t_start:.1f}")
 
-# Dual scoreboard: legacy 7-coin reference score
+# Dual scoreboard: legacy 7-coin reference score (cancel alarm to avoid timeout)
+sig.alarm(0)
 training_symbols = get_symbols("training")
 if set(training_symbols) != set(DEFAULT_SYMBOLS):
     legacy_data = load_data("val", symbols=DEFAULT_SYMBOLS)

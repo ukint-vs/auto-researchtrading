@@ -67,6 +67,8 @@ CAP_TIERS = {
     "ICP": 2, "ATOM": 2, "ARB": 2, "OP": 2, "SUI": 2, "SEI": 2,
 }
 TRAINING_TIER_MIN = {1: 2, 2: 3}  # min coins per tier in training set
+MIN_BARS_PER_SPLIT = 1000         # exclude symbols with fewer bars in a split
+MAX_PRICE_RATIO = 1000            # exclude symbols with extreme price swings (bad data)
 
 # ---------------------------------------------------------------------------
 # Universe discovery
@@ -227,10 +229,10 @@ def _validate_symbols(symbols, split="val"):
         mask = (df["timestamp"] >= start_ms) & (df["timestamp"] < end_ms)
         split_df = df[mask].reset_index(drop=True)
         split_df = split_df[split_df["close"] > 0].reset_index(drop=True)
-        if len(split_df) < 1000:
+        if len(split_df) < MIN_BARS_PER_SPLIT:
             continue
         price_ratio = split_df["close"].max() / split_df["close"].min()
-        if price_ratio > 1000:
+        if price_ratio > MAX_PRICE_RATIO:
             continue
         valid.append(symbol)
     return valid if valid else list(DEFAULT_SYMBOLS)
@@ -491,10 +493,10 @@ def load_data(split: str = "val", symbols=None) -> dict:
         # Reject coins with extreme price ratio (bad data or pre-launch artifacts)
         if len(split_df) > 0:
             price_ratio = split_df["close"].max() / split_df["close"].min()
-            if price_ratio > 1000:
+            if price_ratio > MAX_PRICE_RATIO:
                 print(f"  Warning: {symbol} has extreme price ratio ({price_ratio:.0f}x) in {split} split, excluding")
                 continue
-        if len(split_df) < 1000:
+        if len(split_df) < MIN_BARS_PER_SPLIT:
             if len(split_df) > 0:
                 print(f"  Warning: {symbol} has only {len(split_df)} bars in {split} split, excluding")
             continue

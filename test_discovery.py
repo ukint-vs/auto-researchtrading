@@ -122,7 +122,9 @@ class TestGetSymbols(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(universe, f)
             f.flush()
-            with patch("prepare.UNIVERSE_CACHE", f.name):
+            # Mock _validate_symbols so test doesn't depend on local parquet files
+            with patch("prepare.UNIVERSE_CACHE", f.name), \
+                 patch("prepare._validate_symbols", return_value=["BTC", "ETH", "SOL"]):
                 result = get_symbols("training")
                 assert result == ["BTC", "ETH", "SOL"]
                 result_pipe = get_symbols("pipeline")
