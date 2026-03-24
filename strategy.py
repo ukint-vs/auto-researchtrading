@@ -13,6 +13,7 @@ DSP as signal replacement failed (exp103-107), but DSP as EXIT MODIFIER works.
 """
 
 import numpy as np
+import pandas as pd
 from prepare import Signal, PortfolioState, BarData
 
 ACTIVE_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
@@ -132,19 +133,17 @@ class Strategy:
         """Calculate current BB width percentile over lookback."""
         if len(closes) < period * 3:
             return 50.0
-        # Calculate rolling BB width
-        widths = []
-        for i in range(period * 2, len(closes)):
-            window = closes[i-period:i]
-            sma = np.mean(window)
-            std = np.std(window)
-            width = (2 * std) / sma if sma > 0 else 0
-            widths.append(width)
+        c = pd.Series(closes)
+        sma = c.rolling(period).mean()
+        std = c.rolling(period).std(ddof=0)
+        all_widths = (2 * std / sma)
+        # Match original loop: starts at i=period*2 (rolling idx period*2-1),
+        # ends at i=len-1 (rolling idx len-2). Original excludes current bar.
+        widths = all_widths.iloc[period * 2 - 1 : len(closes) - 1].dropna()
         if len(widths) < 2:
             return 50.0
-        current_width = widths[-1]
-        # Percentile of current width
-        pctile = 100 * np.sum(np.array(widths) <= current_width) / len(widths)
+        current_width = widths.iloc[-1]
+        pctile = 100.0 * (widths <= current_width).sum() / len(widths)
         return pctile
 
     def _ehlers_eot(self, closes, lpperiod, k1, k2):
