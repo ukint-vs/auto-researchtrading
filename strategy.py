@@ -396,10 +396,9 @@ class Strategy:
                     self.peak_prices[symbol] = mid
 
                 # SDO-adaptive ATR stop: tighten when SDO at extremes
-                sdo_len = 50  # 20 warmup + 3 SMA + 9 EMA signal + margin
-                highs_h = bd.history["high"].values[-sdo_len:]
-                lows_h = bd.history["low"].values[-sdo_len:]
-                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes[-sdo_len:])
+                highs_h = bd.history["high"].values
+                lows_h = bd.history["low"].values
+                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes)
                 atr_mult = ATR_STOP_MULT
                 if current_pos > 0 and sdo_val[-1] > 80:
                     atr_mult = 3.5  # tighten stop when overbought
