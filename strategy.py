@@ -1,13 +1,14 @@
 """
-Champion strategy (expanded universe, score 31.36).
+Champion strategy — live-realistic (expanded universe).
 
-N-coin equal-weight ensemble with 5/9 majority vote (9 signals):
+N-coin equal-weight ensemble with 5/7 majority vote (7 signals):
   Dynamic symbols from get_symbols("training") with 1/N weighting.
 Signals: Momentum (12h), very-short momentum (6h), EMA(5/23) crossover,
-  RSI(4), MACD(7/30/2), BB width compression (period=6, <93rd pctile),
-  RSI divergence (lookback=14), Donchian 5-bar 70% breakout, 3-bar micro momentum.
+  RSI(4), MACD(7/30/2), RSI divergence (lookback=14), Donchian 5-bar 70% breakout.
+Dropped: BB compression (92% fire rate = padding), 3-bar micro momentum (51% = coin flip).
 Exits: ATR trailing stop (5.5x, tightened to 1.85x by SDO 10/14 at 85/15 extremes),
   RSI(4) mean-reversion (74/26), signal flip.
+Live constraints: COOLDOWN=1, MIN_ENTRY_MOVE=15bps fee buffer.
 
 Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
   → autoresearch s1: +RSI div, BB 7→5, pos 0.08→0.075 = 24.82
@@ -92,8 +93,9 @@ BH_EXTREME_OB = 0.8        # EOT3 q5 > this = overbought extreme
 BH_EXTREME_OS = -0.8       # EOT3 q5 < this = oversold extreme
 BH_TREND_WIDTH = 0.3       # |q3-q4| < this = trending (EOT2 converged)
 
-COOLDOWN_BARS = 0
-MIN_VOTES = 5  # out of 9
+COOLDOWN_BARS = 1
+MIN_VOTES = 5  # out of 7 (dropped BB padding + micro coin-flip)
+MIN_ENTRY_MOVE = 0.0015  # 15bps — skip entries where expected move < fees
 
 def ema(values, span):
     alpha = 2.0 / (span + 1)
@@ -421,11 +423,7 @@ class Strategy:
             macd_bull = macd_hist > 0
             macd_bear = macd_hist < 0
 
-            # BB width: low percentile = compression = pending breakout
-            bb_pctile = self._calc_bb_width_pctile(closes, BB_PERIOD)
-            bb_compressed = bb_pctile < 93  # Below 90th percentile = compressed
-
-            # RSI divergence as 7th additive signal
+            # RSI divergence
             _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes, RSI_PERIOD, 14)
 
             donch_high = np.max(closes[-5:-1])
@@ -433,12 +431,15 @@ class Strategy:
             donch_range = donch_high - donch_low
             donch_bull = closes[-1] >= donch_low + donch_range * 0.70
             donch_bear = closes[-1] <= donch_low + donch_range * 0.30
-            # 3-bar micro momentum
-            micro_ret = np.log(closes[-1] / closes[-3])
-            micro_bull = micro_ret > 0
-            micro_bear = micro_ret < 0
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, bb_compressed, has_bull_div, donch_bull, micro_bull])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, bb_compressed, has_bear_div, donch_bear, micro_bear])
+
+            # 7-signal ensemble (dropped BB padding 92% fire rate, micro coin-flip 51%)
+            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, has_bull_div, donch_bull])
+            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, has_bear_div, donch_bear])
+
+            # Fee buffer: skip entries where expected move is too small
+            if abs(ret_short) < MIN_ENTRY_MOVE:
+                bull_votes = 0
+                bear_votes = 0
 
             btc_confirm = True
             if symbol != "BTC":

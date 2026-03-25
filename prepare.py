@@ -34,6 +34,29 @@ LOOKBACK_BARS = 500            # history buffer provided to strategy
 BAR_INTERVAL = "1h"
 MAINTENANCE_MARGIN_PCT = 5.0   # % of initial capital — intra-bar liquidation threshold
 
+# ---------------------------------------------------------------------------
+# Realistic mode (REALISTIC_BACKTEST=1 env var)
+# Harsher fees, re-entry penalty, market impact, connection gaps.
+# Normal autoresearch uses standard mode; validate with realistic mode.
+# ---------------------------------------------------------------------------
+REALISTIC_MODE = os.environ.get("REALISTIC_BACKTEST", "0") == "1"
+
+# Realistic overrides (only applied when REALISTIC_MODE is True)
+REALISTIC_TAKER_FEE = 0.00045      # 4.5bps (3.5bps taker + 1bp builder)
+REALISTIC_SLIPPAGE_BPS = 2.5       # 2.5bps (wider for mid-cap)
+REENTRY_WINDOW = 3                 # bars — re-entry within this gets penalized
+REENTRY_SLIPPAGE_MULT = 2.5        # slippage multiplier on quick re-entry
+IMPACT_THRESHOLD_PCT = 0.05        # orders > 5% of bar volume get extra slippage
+IMPACT_MULTIPLIER = 3.0            # bps per 1% of volume above threshold
+MAX_FILL_PCT_OF_VOLUME = 0.10      # cap fill at 10% of bar volume
+GAP_FREQUENCY = 168                # avg bars between connection gaps
+GAP_DURATION_MIN = 2               # min gap length
+GAP_DURATION_MAX = 4               # max gap length
+
+if REALISTIC_MODE:
+    TAKER_FEE = REALISTIC_TAKER_FEE
+    SLIPPAGE_BPS = REALISTIC_SLIPPAGE_BPS
+
 DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
 SYMBOLS = DEFAULT_SYMBOLS  # backward compat alias
 
@@ -575,6 +598,16 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
     total_volume = 0.0
     prev_equity = INITIAL_CAPITAL
 
+    # Realistic mode state
+    last_exit_bar = {}   # symbol -> bar_index (for re-entry penalty)
+    bar_index = 0
+    gap_remaining = 0
+    next_gap = 0
+    if REALISTIC_MODE:
+        rng = np.random.RandomState(42)
+        next_gap = rng.geometric(1.0 / GAP_FREQUENCY)
+    pending_signals = []  # for next-bar-open execution in realistic mode
+
     for ts in timestamps:
         elapsed = time.time() - t_start
         if elapsed > TIME_BUDGET:
@@ -615,6 +648,8 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
         if not bar_data:
             continue
 
+        bar_index += 1
+
         # Update portfolio equity (mark-to-market)
         unrealized_pnl = _calc_unrealized_pnl(portfolio.positions, portfolio.entry_prices, bar_data)
         portfolio.equity = portfolio.cash + sum(abs(v) for v in portfolio.positions.values()) + unrealized_pnl
@@ -628,13 +663,109 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
                 funding_payment = pos_notional * fr / 8.0
                 portfolio.cash -= funding_payment
 
+        # --- Realistic: connection gap simulation ---
+        if REALISTIC_MODE and gap_remaining > 0:
+            gap_remaining -= 1
+            # Bot is offline: still mark-to-market but no signals, no stops
+            current_equity = portfolio.cash + sum(abs(v) for v in portfolio.positions.values()) + unrealized_pnl
+            equity_curve.append(current_equity)
+            if prev_equity > 0:
+                hourly_returns.append((current_equity - prev_equity) / prev_equity)
+            prev_equity = current_equity
+            continue
+
+        if REALISTIC_MODE and bar_index >= next_gap:
+            gap_remaining = rng.randint(GAP_DURATION_MIN, GAP_DURATION_MAX + 1)
+            next_gap = bar_index + rng.geometric(1.0 / GAP_FREQUENCY)
+
+        # --- Realistic: execute pending signals from previous bar at this bar's open ---
+        if REALISTIC_MODE and pending_signals:
+            for sig in pending_signals:
+                if sig.symbol not in bar_data:
+                    continue
+                exec_price_base = bar_data[sig.symbol].open  # next-bar open
+                current_pos = portfolio.positions.get(sig.symbol, 0.0)
+                delta = sig.target_position - current_pos
+                if abs(delta) < 1.0:
+                    continue
+                new_positions = dict(portfolio.positions)
+                new_positions[sig.symbol] = sig.target_position
+                total_exposure = sum(abs(v) for v in new_positions.values())
+                if total_exposure > portfolio.equity * MAX_LEVERAGE:
+                    continue
+
+                eff_bps = SLIPPAGE_BPS
+                # Re-entry penalty
+                if sig.symbol in last_exit_bar:
+                    if bar_index - last_exit_bar[sig.symbol] <= REENTRY_WINDOW:
+                        eff_bps *= REENTRY_SLIPPAGE_MULT
+                # Market impact
+                bar_vol_usd = bar_data[sig.symbol].volume * bar_data[sig.symbol].close
+                if bar_vol_usd > 0:
+                    order_pct = abs(delta) / bar_vol_usd
+                    if order_pct > IMPACT_THRESHOLD_PCT:
+                        excess_pct = (order_pct - IMPACT_THRESHOLD_PCT) * 100
+                        eff_bps += excess_pct * IMPACT_MULTIPLIER
+                # Partial fill
+                if bar_vol_usd > 0:
+                    max_fill = bar_vol_usd * MAX_FILL_PCT_OF_VOLUME
+                    if abs(delta) > max_fill > 0:
+                        delta = (delta / abs(delta)) * max_fill
+                        sig = Signal(symbol=sig.symbol,
+                                     target_position=current_pos + delta,
+                                     order_type=sig.order_type)
+
+                slippage = exec_price_base * eff_bps / 10000
+                fee_rate = TAKER_FEE
+                exec_price = exec_price_base + slippage if delta > 0 else exec_price_base - slippage
+                fee = abs(delta) * fee_rate
+                portfolio.cash -= fee
+                total_volume += abs(delta)
+
+                if sig.target_position == 0:
+                    if sig.symbol in portfolio.entry_prices:
+                        entry = portfolio.entry_prices[sig.symbol]
+                        if entry > 0:
+                            pnl = current_pos * (exec_price - entry) / entry
+                            portfolio.cash += abs(current_pos) + pnl
+                        del portfolio.entry_prices[sig.symbol]
+                    if sig.symbol in portfolio.positions:
+                        del portfolio.positions[sig.symbol]
+                    last_exit_bar[sig.symbol] = bar_index
+                    trade_log.append(("close", sig.symbol, delta, exec_price, pnl if 'pnl' in dir() else 0))
+                elif current_pos == 0:
+                    portfolio.cash -= abs(sig.target_position)
+                    portfolio.positions[sig.symbol] = sig.target_position
+                    portfolio.entry_prices[sig.symbol] = exec_price
+                    trade_log.append(("open", sig.symbol, delta, exec_price, 0))
+                else:
+                    old_notional = abs(current_pos)
+                    old_entry = portfolio.entry_prices.get(sig.symbol, exec_price)
+                    if abs(sig.target_position) < abs(current_pos):
+                        reduced = abs(current_pos) - abs(sig.target_position)
+                        pnl = (current_pos / abs(current_pos)) * reduced * (exec_price - old_entry) / old_entry if old_entry > 0 else 0
+                        portfolio.cash += reduced + pnl
+                    elif abs(sig.target_position) > abs(current_pos):
+                        added = abs(sig.target_position) - abs(current_pos)
+                        portfolio.cash -= added
+                        if old_notional + added > 0:
+                            portfolio.entry_prices[sig.symbol] = (old_entry * old_notional + exec_price * added) / (old_notional + added)
+                    portfolio.positions[sig.symbol] = sig.target_position
+                    trade_log.append(("modify", sig.symbol, delta, exec_price, 0))
+            pending_signals = []
+
         # Get signals from strategy
         try:
             signals = strategy.on_bar(bar_data, portfolio)
         except Exception:
             signals = []
 
-        # Execute signals
+        # --- Realistic: buffer signals for next-bar execution ---
+        if REALISTIC_MODE:
+            pending_signals = signals or []
+            signals = []  # don't execute this bar
+
+        # Execute signals (standard mode only — realistic uses pending_signals)
         for sig in (signals or []):
             if sig.symbol not in bar_data:
                 continue
@@ -660,6 +791,32 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
                 eff_bps = _vol_adjusted_slippage(br_pct)
             else:
                 eff_bps = SLIPPAGE_BPS
+
+            # Realistic: re-entry slippage penalty (standard execution path)
+            if REALISTIC_MODE and sig.symbol in last_exit_bar:
+                if bar_index - last_exit_bar[sig.symbol] <= REENTRY_WINDOW:
+                    eff_bps *= REENTRY_SLIPPAGE_MULT
+
+            # Realistic: market impact for large orders
+            if REALISTIC_MODE and sig.symbol in bar_data:
+                bar_vol_usd = bar_data[sig.symbol].volume * current_price
+                if bar_vol_usd > 0:
+                    order_pct = abs(delta) / bar_vol_usd
+                    if order_pct > IMPACT_THRESHOLD_PCT:
+                        excess_pct = (order_pct - IMPACT_THRESHOLD_PCT) * 100
+                        eff_bps += excess_pct * IMPACT_MULTIPLIER
+
+            # Realistic: partial fills
+            if REALISTIC_MODE and sig.symbol in bar_data:
+                bar_vol_usd = bar_data[sig.symbol].volume * current_price
+                if bar_vol_usd > 0:
+                    max_fill = bar_vol_usd * MAX_FILL_PCT_OF_VOLUME
+                    if abs(delta) > max_fill > 0:
+                        delta = (delta / abs(delta)) * max_fill
+                        sig = Signal(symbol=sig.symbol,
+                                     target_position=current_pos + delta,
+                                     order_type=sig.order_type)
+
             slippage = current_price * eff_bps / 10000
             fee_rate = TAKER_FEE
             if delta > 0:  # buying
@@ -682,6 +839,7 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
                     del portfolio.entry_prices[sig.symbol]
                 if sig.symbol in portfolio.positions:
                     del portfolio.positions[sig.symbol]
+                last_exit_bar[sig.symbol] = bar_index
                 trade_log.append(("close", sig.symbol, delta, exec_price, pnl if 'pnl' in dir() else 0))
             else:
                 if current_pos == 0:

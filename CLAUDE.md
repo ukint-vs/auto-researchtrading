@@ -160,8 +160,26 @@ rsi_4h = calc_rsi(closes_4h, 8)    # 4h RSI
 4. Use 4h momentum (4h close vs 6-bar-ago close) as a macro trend confirm
 5. Use 4h BB width compression as a breakout detector (lower noise than 1h)
 
-## Current Best Score
+## Current Best Score (Dual-Gate)
 
-**31.36** (6 coins, expanded universe, validation set — full run, no timeout). Beat this to keep your change.
-Legacy reference: 32.06 (7 coins, original universe)
-BASELINE RESET: expanded from 7 to 6 validated coins on 2026-03-24. Coins: BTC, ETH, XRP, DOGE, SOL, FARTCOIN.
+**Gate 1: 22.38** | **Gate 2: 16.60** | **Ratio: 0.74**
+(6 coins, expanded universe, validation set — live-realistic constraints applied)
+
+Gate 1 = `uv run backtest.py` (standard scoring, keep/revert decision)
+Gate 2 = `uv run backtest_live.py` (realistic: next-bar execution, re-entry penalty, market impact)
+Ratio = gate2/gate1 — must be >= 0.50 or revert. Current 0.74 is healthy.
+
+Strategy: 7-signal ensemble, 5/7 vote (71%), COOLDOWN=1, MIN_ENTRY_MOVE=15bps.
+Dropped: BB compression (92% fire = padding), micro momentum (51% = coin flip).
+Legacy reference: 32.06 (7 coins, original universe, pre-realism)
+BASELINE RESET: live-realistic constraints applied 2026-03-25.
+
+## Live-Realism Constraints (NEVER violate)
+
+1. **COOLDOWN_BARS >= 1** — zero cooldown is banned
+2. **Vote ratio >= 60%** — MIN_VOTES / total_signals >= 0.60
+3. **No padding signals** — fire rate must be 20-65% (bull side)
+4. **MIN_ENTRY_MOVE = 0.0015** — skip entries below 15bps momentum
+5. **No more than 8 signals** — adding signals to dilute votes = cheating
+6. **BASE_POSITION_PCT <= 0.06**
+7. **Dual-gate evaluation** — gate2/gate1 ratio >= 0.50 or revert
