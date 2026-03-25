@@ -8,7 +8,7 @@ Autonomous trading strategy research on Hyperliquid perpetual futures.
 FORBIDDEN (immediate revert if violated):
 - Restoring any checkpoint/backup file (strategy_backup.py, strategy_checkpoint.py, etc.)
 - Creating checkpoint/backup copies of strategy.py
-- Batch parameter sweeps — ONE change per experiment, test via backtest.py (runs both gates)
+- Batch sweeps that bypass gate2 (the server and backtest.py both enforce dual-gate)
 - vshort threshold multiplier below 0.3 (below that it's padding)
 - Any parameter change that increases a signal's fire rate above 65%
 - Lowering BASE_THRESHOLD below 0.013 (more tiny trades = more fee drag live)

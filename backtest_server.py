@@ -1,23 +1,23 @@
 """
-Resident backtest evaluator. Keeps data hot in memory, reloads strategy on each run.
-Supports single runs and parallel batch execution of strategy variants.
+Resident backtest evaluator with mandatory dual-gate enforcement.
+Keeps data hot in memory, reloads strategy on each run.
+Every evaluation runs BOTH gate1 (standard) and gate2 (realistic).
+If gate2/gate1 ratio < 0.50, score is forced to -888 (veto).
 
 Usage:
-    uv run backtest_server.py              # Start TCP server on port 9877 (default)
+    uv run backtest_server.py              # Start TCP server on port 9877
     uv run backtest_server.py --port 9878  # Custom port
-    uv run backtest_server.py --stdin      # Read from stdin (pipe mode)
 
 Commands (via TCP):
-    run                          # Reload strategy.py, backtest, return JSON
+    run                          # Reload strategy.py, dual-gate backtest, return JSON
     ping                         # Health check
-    batch:{"variants":[...]}     # Parallel batch: run N variants, return sorted results
+    batch:{"variants":[...]}     # Parallel batch: dual-gate all variants, return sorted
 """
 
 import os
 import sys
 import time
 import json
-import struct
 import socket
 import signal as sig
 import argparse
@@ -26,12 +26,17 @@ import multiprocessing
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
+import prepare
 from prepare import (
     load_data, run_backtest, compute_score, TIME_BUDGET,
     Signal, PortfolioState, BarData,
+    TAKER_FEE as STANDARD_TAKER_FEE,
+    SLIPPAGE_BPS as STANDARD_SLIPPAGE_BPS,
+    REALISTIC_TAKER_FEE, REALISTIC_SLIPPAGE_BPS,
 )
 
 DEFAULT_PORT = 9877
+GATE2_VETO_RATIO = 0.50
 
 # Global data — loaded once in parent, passed to workers via initializer
 data = None
@@ -41,13 +46,41 @@ _worker_data = None
 
 
 def _worker_data_init(shared_data):
-    """Initializer for Pool workers: store data once per worker, not per task."""
+    """Initializer for Pool workers: store data once per worker."""
     global _worker_data
     _worker_data = shared_data
 
 
+def _run_dual_gate(strategy_code, namespace):
+    """Run a strategy through both gates. Returns (gate1_result, gate2_result)."""
+    # Gate 1: standard constants
+    prepare.TAKER_FEE = STANDARD_TAKER_FEE
+    prepare.SLIPPAGE_BPS = STANDARD_SLIPPAGE_BPS
+    prepare.REALISTIC_MODE = False
+
+    strategy1 = namespace["Strategy"]()
+    result1 = run_backtest(strategy1, _worker_data)
+    score1 = compute_score(result1)
+
+    # Gate 2: realistic constants
+    prepare.TAKER_FEE = REALISTIC_TAKER_FEE
+    prepare.SLIPPAGE_BPS = REALISTIC_SLIPPAGE_BPS
+    prepare.REALISTIC_MODE = True
+
+    strategy2 = namespace["Strategy"]()
+    result2 = run_backtest(strategy2, _worker_data)
+    score2 = compute_score(result2)
+
+    # Restore standard
+    prepare.TAKER_FEE = STANDARD_TAKER_FEE
+    prepare.SLIPPAGE_BPS = STANDARD_SLIPPAGE_BPS
+    prepare.REALISTIC_MODE = False
+
+    return result1, score1, result2, score2
+
+
 def _run_variant(args):
-    """Worker function: exec strategy code, run backtest, return result dict."""
+    """Worker function: exec strategy code, run dual-gate backtest, return result dict."""
     variant_id, strategy_code = args
     namespace = {
         "np": np,
@@ -61,19 +94,27 @@ def _run_variant(args):
         if "Strategy" not in namespace:
             return {"variant_id": variant_id, "score": -999,
                     "error_type": "runtime", "error": "No Strategy class defined"}
-        strategy = namespace["Strategy"]()
-        result = run_backtest(strategy, _worker_data)
-        score = compute_score(result)
+
+        result1, score1, result2, score2 = _run_dual_gate(strategy_code, namespace)
+
+        ratio = score2 / score1 if score1 > 0 else 0.0
+        vetoed = ratio < GATE2_VETO_RATIO and score1 > 0
+        effective_score = -888.0 if vetoed else score1
+
         return {
             "variant_id": variant_id,
-            "score": round(score, 6),
-            "sharpe": round(result.sharpe, 6),
-            "total_return_pct": round(result.total_return_pct, 6),
-            "max_drawdown_pct": round(result.max_drawdown_pct, 6),
-            "num_trades": result.num_trades,
-            "win_rate_pct": round(result.win_rate_pct, 6),
-            "profit_factor": round(result.profit_factor, 6),
-            "backtest_seconds": round(result.backtest_seconds, 1),
+            "score": round(effective_score, 6),
+            "gate1_score": round(score1, 6),
+            "gate2_score": round(score2, 6),
+            "ratio": round(ratio, 4),
+            "vetoed": vetoed,
+            "sharpe": round(result1.sharpe, 6),
+            "total_return_pct": round(result1.total_return_pct, 6),
+            "max_drawdown_pct": round(result1.max_drawdown_pct, 6),
+            "num_trades": result1.num_trades,
+            "win_rate_pct": round(result1.win_rate_pct, 6),
+            "profit_factor": round(result1.profit_factor, 6),
+            "backtest_seconds": round(result1.backtest_seconds + result2.backtest_seconds, 1),
         }
     except SyntaxError as e:
         return {"variant_id": variant_id, "score": -999,
@@ -83,11 +124,11 @@ def _run_variant(args):
                 "error_type": "runtime", "error": str(e)}
 
 
-WORKER_TIMEOUT = TIME_BUDGET + 30  # 150s per worker (120s budget + 30s grace)
+WORKER_TIMEOUT = (TIME_BUDGET + 30) * 2  # 2x budget for both gates
 
 
 def handle_batch(batch_json):
-    """Run N strategy variants in parallel, return sorted results."""
+    """Run N strategy variants in parallel with dual-gate, return sorted results."""
     try:
         payload = json.loads(batch_json)
         variants = payload["variants"]
@@ -115,7 +156,7 @@ def handle_batch(batch_json):
 
 
 def handle_run():
-    """Reload strategy, run backtest, return JSON result."""
+    """Reload strategy, run dual-gate backtest, return JSON result."""
     if "strategy" in sys.modules:
         del sys.modules["strategy"]
     try:
@@ -127,25 +168,52 @@ def handle_run():
         raise TimeoutError("backtest exceeded time budget")
 
     sig.signal(sig.SIGALRM, timeout_handler)
-    sig.alarm(TIME_BUDGET + 10)
+    sig.alarm(TIME_BUDGET * 2 + 30)
 
     try:
         t_start = time.time()
-        strategy = Strategy()
-        result = run_backtest(strategy, data)
-        score = compute_score(result)
+
+        # Gate 1: standard
+        prepare.REALISTIC_MODE = False
+        prepare.TAKER_FEE = STANDARD_TAKER_FEE
+        prepare.SLIPPAGE_BPS = STANDARD_SLIPPAGE_BPS
+        strategy1 = Strategy()
+        result1 = run_backtest(strategy1, data)
+        score1 = compute_score(result1)
+
+        # Gate 2: realistic
+        prepare.REALISTIC_MODE = True
+        prepare.TAKER_FEE = REALISTIC_TAKER_FEE
+        prepare.SLIPPAGE_BPS = REALISTIC_SLIPPAGE_BPS
+        strategy2 = Strategy()
+        result2 = run_backtest(strategy2, data)
+        score2 = compute_score(result2)
+
+        # Restore standard
+        prepare.REALISTIC_MODE = False
+        prepare.TAKER_FEE = STANDARD_TAKER_FEE
+        prepare.SLIPPAGE_BPS = STANDARD_SLIPPAGE_BPS
+
         elapsed = time.time() - t_start
 
+        ratio = score2 / score1 if score1 > 0 else 0.0
+        vetoed = ratio < GATE2_VETO_RATIO and score1 > 0
+        effective_score = -888.0 if vetoed else score1
+
         return json.dumps({
-            "score": round(score, 6),
-            "sharpe": round(result.sharpe, 6),
-            "total_return_pct": round(result.total_return_pct, 6),
-            "max_drawdown_pct": round(result.max_drawdown_pct, 6),
-            "num_trades": result.num_trades,
-            "win_rate_pct": round(result.win_rate_pct, 6),
-            "profit_factor": round(result.profit_factor, 6),
-            "annual_turnover": round(result.annual_turnover, 2),
-            "backtest_seconds": round(result.backtest_seconds, 1),
+            "score": round(effective_score, 6),
+            "gate1_score": round(score1, 6),
+            "gate2_score": round(score2, 6),
+            "ratio": round(ratio, 4),
+            "vetoed": vetoed,
+            "sharpe": round(result1.sharpe, 6),
+            "total_return_pct": round(result1.total_return_pct, 6),
+            "max_drawdown_pct": round(result1.max_drawdown_pct, 6),
+            "num_trades": result1.num_trades,
+            "win_rate_pct": round(result1.win_rate_pct, 6),
+            "profit_factor": round(result1.profit_factor, 6),
+            "annual_turnover": round(result1.annual_turnover, 2),
+            "backtest_seconds": round(result1.backtest_seconds + result2.backtest_seconds, 1),
             "total_seconds": round(elapsed, 1),
         })
     except TimeoutError:
@@ -154,10 +222,13 @@ def handle_run():
         return json.dumps({"error": str(e), "score": -999})
     finally:
         sig.alarm(0)
+        prepare.REALISTIC_MODE = False
+        prepare.TAKER_FEE = STANDARD_TAKER_FEE
+        prepare.SLIPPAGE_BPS = STANDARD_SLIPPAGE_BPS
 
 
 def recv_all(conn, timeout=300):
-    """Read all data from connection until EOF (client does shutdown(SHUT_WR))."""
+    """Read all data from connection until EOF."""
     conn.settimeout(timeout)
     chunks = []
     while True:
@@ -172,14 +243,9 @@ def recv_all(conn, timeout=300):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Resident backtest evaluator")
+    parser = argparse.ArgumentParser(description="Resident backtest evaluator (dual-gate)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: 9877)")
-    parser.add_argument("--stdin", action="store_true", help="Read commands from stdin instead of TCP")
     args = parser.parse_args()
-
-    if args.stdin:
-        run_stdin_mode()
-        return
 
     # Load data ONCE on startup
     t_load = time.time()
@@ -190,6 +256,7 @@ def main():
     total_bars = sum(len(df) for df in data.values())
     print(f"Loaded {total_bars} bars across {len(data)} symbols in {load_time:.1f}s", file=sys.stderr)
     print(f"Symbols: {list(data.keys())}", file=sys.stderr)
+    print(f"Dual-gate enforced: gate2/gate1 < {GATE2_VETO_RATIO} → score=-888", file=sys.stderr)
 
     # Start TCP server
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -224,7 +291,7 @@ def main():
             elif raw == "ping":
                 conn.sendall(b'{"status": "ok"}\n')
             elif raw.startswith("batch:"):
-                batch_json = raw[6:]  # strip "batch:" prefix
+                batch_json = raw[6:]
                 result = handle_batch(batch_json)
                 conn.sendall((result + "\n").encode())
             else:
@@ -236,22 +303,6 @@ def main():
                 pass
         finally:
             conn.close()
-
-
-def run_stdin_mode():
-    """Read commands from stdin (for piped input: echo run | uv run backtest_server.py --stdin)."""
-    global data
-    data = load_data("val")
-    total_bars = sum(len(df) for df in data.values())
-    print(f"Loaded {total_bars} bars across {len(data)} symbols", file=sys.stderr)
-    for line in sys.stdin:
-        cmd = line.strip().lower()
-        if cmd == "quit" or cmd == "exit":
-            break
-        if cmd == "run":
-            result = handle_run()
-            print(result)
-            sys.stdout.flush()
 
 
 if __name__ == "__main__":
