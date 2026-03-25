@@ -32,6 +32,7 @@ SLIPPAGE_BPS = 1.0             # 1 bps simulated slippage
 MAX_LEVERAGE = 20              # max leverage allowed
 LOOKBACK_BARS = 500            # history buffer provided to strategy
 BAR_INTERVAL = "1h"
+MAINTENANCE_MARGIN_PCT = 5.0   # % of initial capital — intra-bar liquidation threshold
 
 DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "XRP"]
 SYMBOLS = DEFAULT_SYMBOLS  # backward compat alias
@@ -507,10 +508,12 @@ def load_data(split: str = "val", symbols=None) -> dict:
 # Backtesting engine (DO NOT CHANGE)
 # ---------------------------------------------------------------------------
 
-def run_backtest(strategy, data: dict) -> BacktestResult:
+def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestResult:
     """
     Run strategy over data. Returns BacktestResult with full metrics.
     Enforces TIME_BUDGET.
+    When intra_bar_sim=True, uses OHLC high/low for liquidation checks,
+    stop-loss accuracy, and volatility-adjusted slippage.
     """
     t_start = time.time()
 
@@ -541,6 +544,21 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
                 if entry > 0:
                     pnl += pos * (bar_data[sym].close - entry) / entry
         return pnl
+
+    def _calc_unrealized_pnl_at_prices(positions, entry_prices, prices):
+        """Unrealized PnL at arbitrary prices (dict: symbol -> price)."""
+        pnl = 0.0
+        for sym, pos in positions.items():
+            if sym in prices:
+                entry = entry_prices.get(sym, prices[sym])
+                if entry > 0:
+                    pnl += pos * (prices[sym] - entry) / entry
+        return pnl
+
+    def _vol_adjusted_slippage(bar_range_pct, base_bps=SLIPPAGE_BPS):
+        """Scale slippage with bar range — wider bars = more slippage."""
+        range_mult = max(1.0, bar_range_pct / 0.005)
+        return base_bps * range_mult
 
     # Portfolio state
     portfolio = PortfolioState(
@@ -636,7 +654,13 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
                 continue
 
             # Apply slippage and fees
-            slippage = current_price * SLIPPAGE_BPS / 10000
+            if intra_bar_sim and sig.symbol in bar_data:
+                bd_sig = bar_data[sig.symbol]
+                br_pct = (bd_sig.high - bd_sig.low) / current_price if current_price > 0 else 0
+                eff_bps = _vol_adjusted_slippage(br_pct)
+            else:
+                eff_bps = SLIPPAGE_BPS
+            slippage = current_price * eff_bps / 10000
             fee_rate = TAKER_FEE
             if delta > 0:  # buying
                 exec_price = current_price + slippage
@@ -688,7 +712,83 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
                     portfolio.positions[sig.symbol] = sig.target_position
                     trade_log.append(("modify", sig.symbol, delta, exec_price, 0))
 
-        # Recalculate equity after trades
+        # ---------------------------------------------------------------
+        # Intra-bar worst-case simulation (OHLC high/low checks)
+        # ---------------------------------------------------------------
+        if intra_bar_sim and portfolio.positions:
+            # Step A: build adverse prices per position
+            adverse_prices = {}
+            for sym, pos in portfolio.positions.items():
+                if sym in bar_data:
+                    if pos > 0:
+                        adverse_prices[sym] = bar_data[sym].low
+                    else:
+                        adverse_prices[sym] = bar_data[sym].high
+
+            # Step B: portfolio-level liquidation at adverse extreme
+            if adverse_prices:
+                adverse_pnl = _calc_unrealized_pnl_at_prices(
+                    portfolio.positions, portfolio.entry_prices, adverse_prices)
+                adverse_equity = (portfolio.cash
+                    + sum(abs(v) for v in portfolio.positions.values())
+                    + adverse_pnl)
+
+                if adverse_equity < INITIAL_CAPITAL * MAINTENANCE_MARGIN_PCT / 100:
+                    # Force-close all positions at adverse prices
+                    for sym in list(portfolio.positions.keys()):
+                        if sym in adverse_prices:
+                            liq_price = adverse_prices[sym]
+                            pos = portfolio.positions[sym]
+                            entry = portfolio.entry_prices.get(sym, liq_price)
+                            pnl = pos * (liq_price - entry) / entry if entry > 0 else 0
+                            portfolio.cash += abs(pos) + pnl
+                            total_volume += abs(pos)
+                            trade_log.append(("liquidation", sym, -pos, liq_price, pnl))
+                        portfolio.positions.pop(sym, None)
+                        portfolio.entry_prices.pop(sym, None)
+                    # Notify strategy
+                    if hasattr(strategy, 'on_liquidation'):
+                        try:
+                            strategy.on_liquidation(list(adverse_prices.keys()))
+                        except Exception:
+                            pass
+
+            # Step C: individual stop-loss checks at adverse extreme
+            if portfolio.positions and hasattr(strategy, 'get_stop_prices'):
+                try:
+                    stop_prices = strategy.get_stop_prices()
+                except Exception:
+                    stop_prices = {}
+                for sym in list(portfolio.positions.keys()):
+                    if sym not in stop_prices or sym not in bar_data:
+                        continue
+                    pos = portfolio.positions[sym]
+                    stop = stop_prices[sym]
+                    bd_s = bar_data[sym]
+                    hit = (pos > 0 and bd_s.low <= stop) or (pos < 0 and bd_s.high >= stop)
+                    if not hit:
+                        continue
+                    # Execute at stop price + vol-adjusted slippage
+                    br_pct = (bd_s.high - bd_s.low) / bd_s.close if bd_s.close > 0 else 0
+                    slip = stop * _vol_adjusted_slippage(br_pct) / 10000
+                    exec_price = stop - slip if pos > 0 else stop + slip
+                    entry = portfolio.entry_prices.get(sym, exec_price)
+                    pnl = pos * (exec_price - entry) / entry if entry > 0 else 0
+                    portfolio.cash += abs(pos) + pnl
+                    fee = abs(pos) * TAKER_FEE
+                    portfolio.cash -= fee
+                    total_volume += abs(pos)
+                    trade_log.append(("stop_intrabar", sym, -pos, exec_price, pnl))
+                    portfolio.positions.pop(sym, None)
+                    portfolio.entry_prices.pop(sym, None)
+                    # Notify strategy to clear internal state
+                    if hasattr(strategy, 'on_stop_hit'):
+                        try:
+                            strategy.on_stop_hit(sym)
+                        except Exception:
+                            pass
+
+        # Recalculate equity after trades (and intra-bar sim)
         unrealized_pnl = _calc_unrealized_pnl(portfolio.positions, portfolio.entry_prices, bar_data)
         current_equity = portfolio.cash + sum(abs(v) for v in portfolio.positions.values()) + unrealized_pnl
         equity_curve.append(current_equity)
@@ -699,7 +799,8 @@ def run_backtest(strategy, data: dict) -> BacktestResult:
         prev_equity = current_equity
 
         # Liquidation check
-        if current_equity < INITIAL_CAPITAL * 0.01:
+        margin_pct = MAINTENANCE_MARGIN_PCT if intra_bar_sim else 1.0
+        if current_equity < INITIAL_CAPITAL * margin_pct / 100:
             break
 
     t_end = time.time()

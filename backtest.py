@@ -1,13 +1,16 @@
 """
-Run backtest. Usage: uv run backtest.py
+Run backtest. Usage: uv run backtest.py [--intra-bar]
 Imports strategy from strategy.py, runs on validation data, prints metrics.
 This file is fixed — do not modify.
 """
 
+import sys
 import time
 import signal as sig
 
 from prepare import load_data, run_backtest, compute_score, TIME_BUDGET, DEFAULT_SYMBOLS, get_symbols
+
+INTRA_BAR = "--intra-bar" in sys.argv
 
 # Timeout guard
 def timeout_handler(signum, frame):
@@ -27,7 +30,9 @@ data = load_data("val")
 print(f"Loaded {sum(len(df) for df in data.values())} bars across {len(data)} symbols")
 print(f"Symbols: {list(data.keys())}")
 
-result = run_backtest(strategy, data)
+if INTRA_BAR:
+    print("Intra-bar simulation: ENABLED")
+result = run_backtest(strategy, data, intra_bar_sim=INTRA_BAR)
 score = compute_score(result)
 
 t_end = time.time()

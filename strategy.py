@@ -1,12 +1,12 @@
 """
-Champion strategy (expanded universe, legacy val 32.06).
+Champion strategy (expanded universe, score 31.36).
 
 N-coin equal-weight ensemble with 5/9 majority vote (9 signals):
   Dynamic symbols from get_symbols("training") with 1/N weighting.
-Signals: Momentum (12h), very-short momentum (6h), EMA(2/28) crossover,
-  RSI(4), MACD(14/27/2), BB width compression (period=3, <93rd pctile),
-  RSI divergence (lookback=14), Donchian 8-bar 68% breakout, 3-bar micro momentum.
-Exits: ATR trailing stop (5.5x, tightened to 2.0x by SDO 10/14 at extremes),
+Signals: Momentum (12h), very-short momentum (6h), EMA(5/23) crossover,
+  RSI(4), MACD(7/30/2), BB width compression (period=6, <93rd pctile),
+  RSI divergence (lookback=14), Donchian 5-bar 70% breakout, 3-bar micro momentum.
+Exits: ATR trailing stop (5.5x, tightened to 1.85x by SDO 10/14 at 85/15 extremes),
   RSI(4) mean-reversion (74/26), signal flip.
 
 Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO stop, 25.05)
@@ -14,20 +14,14 @@ Evolution: exp251 (3 coins, 21.40) → exp110 (7 coins, 24.69) → exp112 (SDO s
   → autoresearch s2: MACD→15/26/8, VOL_LOOKBACK→42, BASE_THRESHOLD→0.014 = 25.09
   → autoresearch s3: RSI(4), MACD(14/27/2), EMA(2/28), BB(3/<93pctile),
     Donchian 8-bar 68%, 3-bar micro mom, SDO_TIGHT 2.0, log returns = 32.06
-
-Autoresearch s3 log (kept changes only):
-  exp76-92: EMA 7→5, BB 5→3, bb<95, SDO_TIGHT 3.5→2.5, clamp→0.025, ATR_LB→16 (→25.48)
-  exp98-123: EMA_SLOW→28, SDO 10/14, log returns (→25.59)
-  exp130-131: RSI entry/exit 8→4, exit 69/31→74/26 (→27.63 — breakthrough)
-  exp133-145: RSI entry 48/52, EMA_SLOW→31, MACD→14/27/2, tuning (→30.11)
-  exp153: +Donchian 7-bar (30.77)
-  exp165: EMA 5/31→2/28 (30.98)
-  exp178: +3-bar micro momentum, MIN_VOTES 4→5/9 (31.19)
-  exp181: SDO_TIGHT→2.0 (31.34)
-  exp186-189: Donchian 70% range + period 7→8 (31.94)
-  exp191: RSI entry 49/51→48/52 (31.96)
-  exp194-196: BB threshold 95→93 (32.03)
-  exp201: Donchian 70%→68% (32.06)
+  → autoresearch s4 (expanded universe, 6 coins, baseline 28.90):
+    SDO_TIGHT 2.0→1.85 (28.96), EMA_SLOW 28→26 (28.99), MACD_FAST 14→12 (29.11),
+    BB_PERIOD 3→5 (29.11), Donchian 8→7bar (29.38), VOL_LOOKBACK 38→42 (29.40),
+    RSI entry 48/52→50/50 (29.45), SDO_OB/OS 80/20→85/15 (29.47),
+    COOLDOWN 2→0 (29.91 — breakthrough, +0.44), pos 0.065→0.058 (29.98),
+    EMA_SLOW 26→23 (30.20), MACD_FAST 12→7 (30.38), MACD_SLOW 27→30 (30.45),
+    Donchian 7→5bar 70% (31.22), BB_PERIOD 5→6 (31.25), ATR_LB 16→12 (31.26),
+    EMA_FAST 2→5 (31.36)
 """
 
 import numpy as np
@@ -38,26 +32,26 @@ SHORT_WINDOW = 6
 MED_WINDOW = 12
 MED2_WINDOW = 24
 LONG_WINDOW = 36
-EMA_FAST = 2
-EMA_SLOW = 28
+EMA_FAST = 5
+EMA_SLOW = 23
 RSI_PERIOD = 8
-RSI_BULL = 48
-RSI_BEAR = 52
+RSI_BULL = 50
+RSI_BEAR = 50
 RSI_OVERBOUGHT = 74
 RSI_OVERSOLD = 26
 
-MACD_FAST = 14
-MACD_SLOW = 27
+MACD_FAST = 7
+MACD_SLOW = 30
 MACD_SIGNAL = 2
 
-BB_PERIOD = 3
+BB_PERIOD = 6
 
 FUNDING_LOOKBACK = 24
 FUNDING_BOOST = 0.0
-BASE_POSITION_PCT = 0.065
-VOL_LOOKBACK = 38
+BASE_POSITION_PCT = 0.058
+VOL_LOOKBACK = 42
 TARGET_VOL = 0.015
-ATR_LOOKBACK = 16
+ATR_LOOKBACK = 12
 ATR_STOP_MULT = 5.5
 TAKE_PROFIT_PCT = 99.0
 BASE_THRESHOLD = 0.013
@@ -74,9 +68,9 @@ DD_REDUCE_SCALE = 0.5
 SDO_STOCH_LEN = 10
 SDO_DONCH_LEN = 14
 SDO_SMOOTH_LEN = 3
-SDO_OVERBOUGHT = 80
-SDO_OVERSOLD = 20
-SDO_TIGHT_ATR_MULT = 2.0
+SDO_OVERBOUGHT = 85
+SDO_OVERSOLD = 15
+SDO_TIGHT_ATR_MULT = 1.85
 
 # Higher timeframe indicator params (used with aggregate_tf)
 HTF_PERIOD = 4            # hours per bar (4, 12, or 24)
@@ -98,7 +92,7 @@ BH_EXTREME_OB = 0.8        # EOT3 q5 > this = overbought extreme
 BH_EXTREME_OS = -0.8       # EOT3 q5 < this = oversold extreme
 BH_TREND_WIDTH = 0.3       # |q3-q4| < this = trending (EOT2 converged)
 
-COOLDOWN_BARS = 2
+COOLDOWN_BARS = 0
 MIN_VOTES = 5  # out of 9
 
 def ema(values, span):
@@ -186,6 +180,7 @@ class Strategy:
         self.peak_equity = 100000.0
         self.exit_bar = {}
         self.bar_count = 0
+        self._current_stops = {}  # symbol -> stop price (for intra-bar sim)
 
     def _calc_atr(self, history, lookback):
         if len(history) < lookback + 1:
@@ -433,11 +428,11 @@ class Strategy:
             # RSI divergence as 7th additive signal
             _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes, RSI_PERIOD, 14)
 
-            donch_high = np.max(closes[-8:-1])
-            donch_low = np.min(closes[-8:-1])
+            donch_high = np.max(closes[-5:-1])
+            donch_low = np.min(closes[-5:-1])
             donch_range = donch_high - donch_low
-            donch_bull = closes[-1] >= donch_low + donch_range * 0.68
-            donch_bear = closes[-1] <= donch_low + donch_range * 0.32
+            donch_bull = closes[-1] >= donch_low + donch_range * 0.70
+            donch_bear = closes[-1] <= donch_low + donch_range * 0.30
             # 3-bar micro momentum
             micro_ret = np.log(closes[-1] / closes[-3])
             micro_bull = micro_ret > 0
@@ -526,6 +521,7 @@ class Strategy:
                     stop = self.peak_prices[symbol] + atr_mult * atr
                     if mid > stop:
                         target = 0.0
+                self._current_stops[symbol] = stop
 
                 if symbol in self.entry_prices:
                     entry = self.entry_prices[symbol]
@@ -556,6 +552,7 @@ class Strategy:
                     self.peak_prices.pop(symbol, None)
                     self.atr_at_entry.pop(symbol, None)
                     self.pyramided.pop(symbol, None)
+                    self._current_stops.pop(symbol, None)
                     self.exit_bar[symbol] = self.bar_count
                 elif (target > 0 and current_pos < 0) or (target < 0 and current_pos > 0):
                     self.entry_prices[symbol] = mid
@@ -564,3 +561,26 @@ class Strategy:
                     self.pyramided[symbol] = False
 
         return signals
+
+    def get_stop_prices(self):
+        """Current trailing stop prices for open positions (for intra-bar sim)."""
+        return dict(self._current_stops)
+
+    def on_liquidation(self, symbols):
+        """Called by backtester when intra-bar liquidation is triggered."""
+        for sym in symbols:
+            self.entry_prices.pop(sym, None)
+            self.peak_prices.pop(sym, None)
+            self.atr_at_entry.pop(sym, None)
+            self.pyramided.pop(sym, None)
+            self._current_stops.pop(sym, None)
+            self.exit_bar[sym] = self.bar_count
+
+    def on_stop_hit(self, symbol):
+        """Called by backtester when intra-bar stop-loss triggers."""
+        self.entry_prices.pop(symbol, None)
+        self.peak_prices.pop(symbol, None)
+        self.atr_at_entry.pop(symbol, None)
+        self.pyramided.pop(symbol, None)
+        self._current_stops.pop(symbol, None)
+        self.exit_bar[symbol] = self.bar_count
