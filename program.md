@@ -2,6 +2,30 @@
 
 Autonomous trading strategy research on Hyperliquid perpetual futures.
 
+## ABSOLUTE RULES — read before every experiment
+
+```
+FORBIDDEN (immediate revert if violated):
+- Restoring any checkpoint/backup file (strategy_backup.py, strategy_checkpoint.py, etc.)
+- Creating checkpoint/backup copies of strategy.py
+- Batch parameter sweeps — ONE change per experiment, test via backtest.py (runs both gates)
+- vshort threshold multiplier below 0.3 (below that it's padding)
+- Any parameter change that increases a signal's fire rate above 65%
+- Lowering BASE_THRESHOLD below 0.013 (more tiny trades = more fee drag live)
+- Lowering MIN_ENTRY_MOVE below 0.0015 (15bps fee buffer is non-negotiable)
+- Setting COOLDOWN_BARS below 1
+- Setting MIN_VOTES/total_signals below 0.60
+- Adding more than 8 signals total
+- Modifying backtest.py, backtest_live.py, or prepare.py
+
+backtest.py runs BOTH gates automatically. The score it prints is gate1,
+but if gate2/gate1 ratio < 0.50, it prints -888 instead. You cannot
+optimize on gate1 alone — the veto is built into the scoring.
+
+ONE experiment = ONE atomic change → run backtest.py → keep or revert.
+If you make two changes at once, you cannot attribute which one helped.
+```
+
 ## Context
 
 This project adapts Karpathy's autoresearch pattern for trading strategy discovery.

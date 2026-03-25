@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## AUTORESEARCH HARD CONSTRAINTS
+
+**Read program.md ABSOLUTE RULES section before every experiment.**
+- backtest.py runs both gates automatically — DO NOT skip or work around this
+- ONE atomic change per experiment — NO batch sweeps
+- DO NOT create or restore strategy backup/checkpoint files
+- DO NOT lower BASE_THRESHOLD, MIN_ENTRY_MOVE, COOLDOWN_BARS, or vote ratio
+- DO NOT add signals that fire > 65% of bars
+
 ## OpenWolf
 
 @.wolf/OPENWOLF.md
