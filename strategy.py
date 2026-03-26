@@ -1,18 +1,20 @@
 """
 Champion strategy — live-realistic (expanded universe).
 
-N-coin equal-weight ensemble with 5/7 majority vote (7 signals):
+N-coin equal-weight ensemble with 5/8 majority vote (8 signals):
   Dynamic symbols from get_symbols("training") with 1/N weighting.
 Signals: Momentum (12h), very-short momentum (6h), EMA(3/23) crossover,
   RSI(4) entry (45/55), MACD(7/34/2), RSI divergence (lookback=14),
-  Donchian 8-bar 60% breakout.
-Exits: SDO-tightened trailing stop (1.85x ATR when SDO 8/14 at 85/15 extremes),
-  RSI(4) mean-reversion (78/22), signal flip.
+  Donchian 8-bar 60% breakout, GGOSC momentum (3/10).
+Exits: GGOSC TP1 (0.8x ATR from entry), SDO-tightened trailing stop
+  (1.85x ATR when SDO 8/14 at 85/15 extremes), RSI(4) mean-reversion
+  (78/22), signal flip.
 Live constraints: COOLDOWN=1, MIN_ENTRY_MOVE=15bps fee buffer.
 
-Score: gate1 24.85 / gate2 18.94 / ratio 0.76
+Score: gate1 27.33 / gate2 20.67 / ratio 0.76
+OOS: test 29.35 (ratio 0.78), train 23.69 (ratio 0.78)
 Evolution: s1-s3 (32.06 pre-realism) → s4 live-realism cleanup (22.38)
-  → s5 parameter tuning (24.85)
+  → s5 parameter tuning (24.85) → s6 GGOSC integration (27.33)
 """
 
 import numpy as np
@@ -53,6 +55,12 @@ SDO_SMOOTH_LEN = 3
 SDO_OVERBOUGHT = 85
 SDO_OVERSOLD = 15
 SDO_TIGHT_ATR_MULT = 1.85
+
+# GGOSC oscillator (entry confirmation + TP exits)
+GGOSC_FAST = 3
+GGOSC_SLOW = 10
+GGOSC_SIGNAL = 3
+GGOSC_TP1_MULT = 0.8       # ATR multiple for take-profit
 
 # Trade management
 COOLDOWN_BARS = 1
@@ -154,6 +162,25 @@ class Strategy:
             full_signal[start:start + len(signal_line)] = signal_line
         return sdo_smooth, full_signal
 
+    def _calc_ggosc(self, highs, lows, closes):
+        """GGOSC momentum oscillator: (EMA_fast - EMA_slow) / ATR of midpoint.
+        Returns oscillator value (positive = bullish, negative = bearish)."""
+        n = len(closes)
+        if n < GGOSC_SLOW + GGOSC_SIGNAL + 2:
+            return 0.0
+        mid = (highs + lows) / 2.0
+        buf = mid[-(GGOSC_SLOW + GGOSC_SIGNAL + 5):]
+        ema_f = ema(buf, GGOSC_FAST)
+        ema_s = ema(buf, GGOSC_SLOW)
+        tr = np.maximum(highs[-len(buf):] - lows[-len(buf):],
+                        np.maximum(np.abs(highs[-len(buf):] - np.roll(closes[-len(buf):], 1)),
+                                   np.abs(lows[-len(buf):] - np.roll(closes[-len(buf):], 1))))
+        tr[0] = highs[-len(buf)] - lows[-len(buf)]
+        atr_arr = ema(tr, ATR_LOOKBACK)
+        atr_arr = np.where(atr_arr > 1e-10, atr_arr, 1e-10)
+        osc_line = (ema_f - ema_s) / atr_arr
+        return float(osc_line[-1])
+
     def _calc_rsi_divergence(self, closes):
         """RSI with bull/bear divergence detection."""
         rsi_val = calc_rsi(closes, RSI_PERIOD)
@@ -238,9 +265,16 @@ class Strategy:
             donch_bull = closes[-1] >= donch_low + donch_range * 0.60
             donch_bear = closes[-1] <= donch_low + donch_range * 0.40
 
-            # 7-signal ensemble vote
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, has_bull_div, donch_bull])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, has_bear_div, donch_bear])
+            # GGOSC oscillator as 8th signal
+            highs_h = bd.history["high"].values
+            lows_h = bd.history["low"].values
+            ggosc_val = self._calc_ggosc(highs_h, lows_h, closes)
+            ggosc_bull = ggosc_val > 0
+            ggosc_bear = ggosc_val < 0
+
+            # 8-signal ensemble vote (5/8 = 62.5%)
+            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, has_bull_div, donch_bull, ggosc_bull])
+            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, has_bear_div, donch_bear, ggosc_bear])
 
             # Fee buffer: skip entries where expected move < fees
             if abs(ret_short) < MIN_ENTRY_MOVE:
@@ -291,6 +325,15 @@ class Strategy:
                         if mid > stop:
                             target = 0.0
                         self._current_stops[symbol] = stop
+
+                # GGOSC TP1: take profit at 0.8× ATR from entry
+                if symbol in self.entry_prices:
+                    entry = self.entry_prices[symbol]
+                    entry_atr = self.atr_at_entry.get(symbol, mid * 0.02)
+                    if current_pos > 0 and mid >= entry + GGOSC_TP1_MULT * entry_atr:
+                        target = 0.0
+                    elif current_pos < 0 and mid <= entry - GGOSC_TP1_MULT * entry_atr:
+                        target = 0.0
 
                 # RSI mean-reversion exit
                 if current_pos > 0 and rsi > RSI_OVERBOUGHT:
