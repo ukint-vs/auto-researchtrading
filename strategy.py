@@ -19,24 +19,29 @@ Evolution: s1-s3 (32.06 pre-realism) → s4 live-realism cleanup (22.38)
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-from prepare import Signal, PortfolioState, BarData, get_symbols
+from prepare import Signal, PortfolioState, BarData, get_symbols, BAR_MULTIPLIER
 
-# Momentum windows
+# All indicator parameters are in 1h bar counts.
+# When running on 5m bars, the strategy aggregates 5m→1h before computing indicators.
+# Only COOLDOWN_BARS is scaled to the execution timeframe.
+
+# Momentum windows (1h bars)
 SHORT_WINDOW = 6
 MED_WINDOW = 12
 
-# EMA crossover
+# EMA crossover (1h bars)
 EMA_FAST = 3
 EMA_SLOW = 23
 
-# RSI
-RSI_PERIOD = 8          # for divergence
-RSI_BULL = 45           # entry threshold
+# RSI (1h bars)
+RSI_PERIOD = 8
+RSI_ENTRY_PERIOD = 4
+RSI_BULL = 45
 RSI_BEAR = 55
-RSI_OVERBOUGHT = 78     # exit threshold
+RSI_OVERBOUGHT = 78
 RSI_OVERSOLD = 22
 
-# MACD
+# MACD (1h bars)
 MACD_FAST = 7
 MACD_SLOW = 34
 MACD_SIGNAL = 2
@@ -47,7 +52,7 @@ VOL_LOOKBACK = 50
 TARGET_VOL = 0.015
 BASE_THRESHOLD = 0.013
 
-# SDO stop tightening
+# SDO stop tightening (1h bars)
 ATR_LOOKBACK = 12
 SDO_STOCH_LEN = 8
 SDO_DONCH_LEN = 14
@@ -56,16 +61,25 @@ SDO_OVERBOUGHT = 85
 SDO_OVERSOLD = 15
 SDO_TIGHT_ATR_MULT = 1.85
 
-# GGOSC oscillator (entry confirmation + TP exits)
+# Donchian breakout (1h bars)
+DONCH_LOOKBACK = 8
+
+# RSI divergence (1h bars)
+RSI_DIV_LOOKBACK = 14
+
+# GGOSC oscillator (1h bars — entry confirmation + TP exits)
 GGOSC_FAST = 3
 GGOSC_SLOW = 10
 GGOSC_SIGNAL = 3
 GGOSC_TP1_MULT = 0.8       # ATR multiple for take-profit
 
-# Trade management
-COOLDOWN_BARS = 1
+# Trade management — COOLDOWN is in execution-TF bars (5m when BAR_MULTIPLIER=12)
+COOLDOWN_BARS = 1 * BAR_MULTIPLIER
 MIN_VOTES = 5
 MIN_ENTRY_MOVE = 0.0015
+
+# Minimum 1h bars needed for indicators
+_MIN_1H_BARS = MACD_SLOW + MACD_SIGNAL + 6
 
 
 def ema(values, span):
@@ -89,6 +103,59 @@ def calc_rsi(closes, period):
     return 100 - 100 / (1 + rs)
 
 
+def _aggregate_to_1h(history_df):
+    """Aggregate sub-hourly bars to 1h OHLCV arrays.
+
+    Groups by floor(timestamp / 3600000) * 3600000, returns dict of numpy arrays.
+    Only returns complete hours (drops partial last hour).
+    """
+    ts = history_df["timestamp"].values
+    opens = history_df["open"].values
+    highs = history_df["high"].values
+    lows = history_df["low"].values
+    closes = history_df["close"].values
+    volumes = history_df["volume"].values
+
+    # Hour boundaries
+    hour_keys = ts // 3600000
+    unique_hours = np.unique(hour_keys)
+
+    n = len(unique_hours)
+    if n == 0:
+        return None
+
+    h_open = np.empty(n)
+    h_high = np.empty(n)
+    h_low = np.empty(n)
+    h_close = np.empty(n)
+    h_vol = np.empty(n)
+
+    for i, hk in enumerate(unique_hours):
+        mask = hour_keys == hk
+        h_open[i] = opens[mask][0]
+        h_high[i] = highs[mask].max()
+        h_low[i] = lows[mask].min()
+        h_close[i] = closes[mask][-1]
+        h_vol[i] = volumes[mask].sum()
+
+    # Drop last hour if partial (< BAR_MULTIPLIER bars)
+    last_mask = hour_keys == unique_hours[-1]
+    if last_mask.sum() < BAR_MULTIPLIER:
+        n -= 1
+        if n == 0:
+            return None
+        h_open = h_open[:n]
+        h_high = h_high[:n]
+        h_low = h_low[:n]
+        h_close = h_close[:n]
+        h_vol = h_vol[:n]
+
+    return {
+        "open": h_open, "high": h_high, "low": h_low,
+        "close": h_close, "volume": h_vol,
+    }
+
+
 class Strategy:
     def __init__(self, symbols=None):
         self._symbols = symbols if symbols is not None else get_symbols("training")
@@ -99,15 +166,71 @@ class Strategy:
         self.exit_bar = {}
         self.bar_count = 0
         self._current_stops = {}
+        self._use_agg = BAR_MULTIPLIER > 1
+        # Incremental 1h bar buffer per symbol (avoids re-aggregating 700 rows)
+        self._1h_buf = {}         # symbol -> {"open": list, "high": list, "low": list, "close": list}
+        self._1h_buf_hour = {}    # symbol -> last completed hour key
+        # Cache signal decisions between hours
+        self._signal_cache = {}   # symbol -> cached indicator results
 
-    def _calc_atr(self, history, lookback):
-        if len(history) < lookback + 1:
+    def _get_1h_arrays(self, bd):
+        """Get 1h OHLCV arrays. At 1h: direct from history. At 5m: from incremental buffer."""
+        if not self._use_agg:
+            closes = bd.history["close"].values
+            highs = bd.history["high"].values
+            lows = bd.history["low"].values
+            return closes, highs, lows
+
+        # Between hours: history is None, return cached or None
+        if bd.history is None:
+            return None, None, None
+
+        # At hour boundary: aggregate and update incremental buffer
+        current_hour = bd.timestamp // 3600000
+        sym = bd.symbol
+
+        if sym not in self._1h_buf:
+            # First call for this symbol — full aggregation to seed the buffer
+            agg = _aggregate_to_1h(bd.history)
+            if agg is None or len(agg["close"]) < _MIN_1H_BARS:
+                return None, None, None
+            self._1h_buf[sym] = {
+                "open": list(agg["open"]),
+                "high": list(agg["high"]),
+                "low": list(agg["low"]),
+                "close": list(agg["close"]),
+            }
+            self._1h_buf_hour[sym] = current_hour
+        elif self._1h_buf_hour.get(sym) != current_hour:
+            # New hour — append one 1h bar from last 12 5m bars
+            hist_c = bd.history["close"].values
+            hist_h = bd.history["high"].values
+            hist_l = bd.history["low"].values
+            hist_o = bd.history["open"].values
+            if len(hist_c) >= BAR_MULTIPLIER:
+                self._1h_buf[sym]["open"].append(float(hist_o[-BAR_MULTIPLIER]))
+                self._1h_buf[sym]["high"].append(float(hist_h[-BAR_MULTIPLIER:].max()))
+                self._1h_buf[sym]["low"].append(float(hist_l[-BAR_MULTIPLIER:].min()))
+                self._1h_buf[sym]["close"].append(float(hist_c[-1]))
+                # Keep last 60 bars
+                max_buf = 60
+                for k in self._1h_buf[sym]:
+                    if len(self._1h_buf[sym][k]) > max_buf:
+                        self._1h_buf[sym][k] = self._1h_buf[sym][k][-max_buf:]
+            self._1h_buf_hour[sym] = current_hour
+
+        buf = self._1h_buf.get(sym)
+        if buf is None or len(buf["close"]) < _MIN_1H_BARS:
+            return None, None, None
+        return np.array(buf["close"]), np.array(buf["high"]), np.array(buf["low"])
+
+    def _calc_atr(self, highs, lows, closes, lookback):
+        if len(highs) < lookback + 1:
             return None
-        highs = history["high"].values[-lookback:]
-        lows = history["low"].values[-lookback:]
-        closes = history["close"].values[-(lookback+1):-1]
-        tr = np.maximum(highs - lows,
-                        np.maximum(np.abs(highs - closes), np.abs(lows - closes)))
+        h = highs[-lookback:]
+        l = lows[-lookback:]
+        c = closes[-(lookback+1):-1]
+        tr = np.maximum(h - l, np.maximum(np.abs(h - c), np.abs(l - c)))
         return np.mean(tr)
 
     def _calc_vol(self, closes, lookback):
@@ -186,7 +309,7 @@ class Strategy:
         rsi_val = calc_rsi(closes, RSI_PERIOD)
         has_bull_div = False
         has_bear_div = False
-        lookback = 14
+        lookback = RSI_DIV_LOOKBACK
 
         if len(closes) < lookback + RSI_PERIOD + 1:
             return rsi_val, has_bull_div, has_bear_div
@@ -208,108 +331,111 @@ class Strategy:
 
         return rsi_val, has_bull_div, has_bear_div
 
+    def _compute_and_cache_signals(self, bd, closes, highs, lows, equity):
+        """Full indicator computation at hour boundaries. Cache results."""
+        mid = bd.close
+        symbol = bd.symbol
+
+        realized_vol = self._calc_vol(closes, VOL_LOOKBACK)
+        vol_ratio = realized_vol / TARGET_VOL
+        dyn_threshold = BASE_THRESHOLD * (0.3 + vol_ratio * 0.7)
+        dyn_threshold = max(0.005, min(0.025, dyn_threshold))
+
+        ret_vshort = np.log(closes[-1] / closes[-SHORT_WINDOW])
+        ret_short = np.log(closes[-1] / closes[-MED_WINDOW])
+
+        mom_bull = ret_short > dyn_threshold
+        mom_bear = ret_short < -dyn_threshold
+        vshort_bull = ret_vshort > dyn_threshold * 0.6
+        vshort_bear = ret_vshort < -dyn_threshold * 0.6
+
+        ema_fast_arr = ema(closes[-(EMA_SLOW+10):], EMA_FAST)
+        ema_slow_arr = ema(closes[-(EMA_SLOW+10):], EMA_SLOW)
+        ema_bull = ema_fast_arr[-1] > ema_slow_arr[-1]
+        ema_bear = ema_fast_arr[-1] < ema_slow_arr[-1]
+
+        rsi = calc_rsi(closes, RSI_ENTRY_PERIOD)
+        macd_hist = self._calc_macd(closes)
+        _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes)
+
+        donch_high = np.max(closes[-DONCH_LOOKBACK:-1])
+        donch_low = np.min(closes[-DONCH_LOOKBACK:-1])
+        donch_range = donch_high - donch_low
+        donch_bull = closes[-1] >= donch_low + donch_range * 0.60
+        donch_bear = closes[-1] <= donch_low + donch_range * 0.40
+
+        # GGOSC oscillator as 8th signal
+        ggosc_val = self._calc_ggosc(highs, lows, closes)
+        ggosc_bull = ggosc_val > 0
+        ggosc_bear = ggosc_val < 0
+
+        # 8-signal ensemble vote (5/8 = 62.5%)
+        bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi > RSI_BULL, macd_hist > 0, has_bull_div, donch_bull, ggosc_bull])
+        bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi < RSI_BEAR, macd_hist < 0, has_bear_div, donch_bear, ggosc_bear])
+
+        if abs(ret_short) < MIN_ENTRY_MOVE:
+            bull_votes = 0
+            bear_votes = 0
+
+        atr = self._calc_atr(highs, lows, closes, ATR_LOOKBACK)
+        sdo_val, _ = self._calc_sdo(highs, lows, closes)
+
+        self._signal_cache[symbol] = {
+            "bullish": bull_votes >= MIN_VOTES,
+            "bearish": bear_votes >= MIN_VOTES,
+            "size": equity * BASE_POSITION_PCT * self._weight,
+            "rsi": rsi,
+            "atr": atr,
+            "sdo_last": sdo_val[-1] if len(sdo_val) > 0 else 50.0,
+            "ret_short": ret_short,
+        }
+
     def on_bar(self, bar_data, portfolio):
         signals = []
         equity = portfolio.equity if portfolio.equity > 0 else portfolio.cash
         self.bar_count += 1
-        min_history = MACD_SLOW + MACD_SIGNAL + 6
 
         for symbol in self._symbols:
             if symbol not in bar_data:
                 continue
             bd = bar_data[symbol]
-            if len(bd.history) < min_history:
-                continue
-
-            closes = bd.history["close"].values
             mid = bd.close
 
-            # Dynamic threshold based on realized volatility
-            realized_vol = self._calc_vol(closes, VOL_LOOKBACK)
-            vol_ratio = realized_vol / TARGET_VOL
-            dyn_threshold = BASE_THRESHOLD * (0.3 + vol_ratio * 0.7)
-            dyn_threshold = max(0.005, min(0.025, dyn_threshold))
+            # At hour boundaries (or 1h mode): full indicator computation
+            closes, highs, lows = self._get_1h_arrays(bd)
+            if closes is not None and len(closes) >= _MIN_1H_BARS:
+                self._compute_and_cache_signals(bd, closes, highs, lows, equity)
 
-            # Momentum signals
-            ret_vshort = np.log(closes[-1] / closes[-SHORT_WINDOW])
-            ret_short = np.log(closes[-1] / closes[-MED_WINDOW])
+            # Use cached signals for entry/exit decisions
+            sc = self._signal_cache.get(symbol)
+            if sc is None:
+                continue
 
-            mom_bull = ret_short > dyn_threshold
-            mom_bear = ret_short < -dyn_threshold
-            vshort_bull = ret_vshort > dyn_threshold * 0.6
-            vshort_bear = ret_vshort < -dyn_threshold * 0.6
-
-            # EMA crossover
-            ema_fast_arr = ema(closes[-(EMA_SLOW+10):], EMA_FAST)
-            ema_slow_arr = ema(closes[-(EMA_SLOW+10):], EMA_SLOW)
-            ema_bull = ema_fast_arr[-1] > ema_slow_arr[-1]
-            ema_bear = ema_fast_arr[-1] < ema_slow_arr[-1]
-
-            # RSI entry
-            rsi = calc_rsi(closes, 4)
-            rsi_bull = rsi > RSI_BULL
-            rsi_bear = rsi < RSI_BEAR
-
-            # MACD histogram
-            macd_hist = self._calc_macd(closes)
-            macd_bull = macd_hist > 0
-            macd_bear = macd_hist < 0
-
-            # RSI divergence
-            _, has_bull_div, has_bear_div = self._calc_rsi_divergence(closes)
-
-            # Donchian breakout
-            donch_high = np.max(closes[-8:-1])
-            donch_low = np.min(closes[-8:-1])
-            donch_range = donch_high - donch_low
-            donch_bull = closes[-1] >= donch_low + donch_range * 0.60
-            donch_bear = closes[-1] <= donch_low + donch_range * 0.40
-
-            # GGOSC oscillator as 8th signal
-            highs_h = bd.history["high"].values
-            lows_h = bd.history["low"].values
-            ggosc_val = self._calc_ggosc(highs_h, lows_h, closes)
-            ggosc_bull = ggosc_val > 0
-            ggosc_bear = ggosc_val < 0
-
-            # 8-signal ensemble vote (5/8 = 62.5%)
-            bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi_bull, macd_bull, has_bull_div, donch_bull, ggosc_bull])
-            bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi_bear, macd_bear, has_bear_div, donch_bear, ggosc_bear])
-
-            # Fee buffer: skip entries where expected move < fees
-            if abs(ret_short) < MIN_ENTRY_MOVE:
-                bull_votes = 0
-                bear_votes = 0
-
-            bullish = bull_votes >= MIN_VOTES
-            bearish = bear_votes >= MIN_VOTES
+            bullish = sc["bullish"]
+            bearish = sc["bearish"]
+            size = sc["size"]
+            rsi = sc["rsi"]
             in_cooldown = (self.bar_count - self.exit_bar.get(symbol, -999)) < COOLDOWN_BARS
 
-            size = equity * BASE_POSITION_PCT * self._weight
             current_pos = portfolio.positions.get(symbol, 0.0)
             target = current_pos
 
             if current_pos == 0:
-                # Entry
                 if not in_cooldown:
                     if bullish:
                         target = size
                     elif bearish:
                         target = -size
             else:
-                # Position management: SDO-tightened trailing stop
-                atr = self._calc_atr(bd.history, ATR_LOOKBACK)
+                atr = sc["atr"]
                 if atr is None:
                     atr = self.atr_at_entry.get(symbol, mid * 0.02)
 
                 if symbol not in self.peak_prices:
                     self.peak_prices[symbol] = mid
 
-                highs_h = bd.history["high"].values
-                lows_h = bd.history["low"].values
-                sdo_val, _ = self._calc_sdo(highs_h, lows_h, closes)
-                sdo_extreme = ((current_pos > 0 and sdo_val[-1] > SDO_OVERBOUGHT) or
-                               (current_pos < 0 and sdo_val[-1] < SDO_OVERSOLD))
+                sdo_extreme = ((current_pos > 0 and sc["sdo_last"] > SDO_OVERBOUGHT) or
+                               (current_pos < 0 and sc["sdo_last"] < SDO_OVERSOLD))
 
                 if current_pos > 0:
                     self.peak_prices[symbol] = max(self.peak_prices[symbol], mid)
@@ -335,13 +461,12 @@ class Strategy:
                     elif current_pos < 0 and mid <= entry - GGOSC_TP1_MULT * entry_atr:
                         target = 0.0
 
-                # RSI mean-reversion exit
+                # RSI mean-reversion exit (1h)
                 if current_pos > 0 and rsi > RSI_OVERBOUGHT:
                     target = 0.0
                 elif current_pos < 0 and rsi < RSI_OVERSOLD:
                     target = 0.0
 
-                # Signal flip
                 if current_pos > 0 and bearish and not in_cooldown:
                     target = -size
                 elif current_pos < 0 and bullish and not in_cooldown:
@@ -352,7 +477,7 @@ class Strategy:
                 if target != 0 and current_pos == 0:
                     self.entry_prices[symbol] = mid
                     self.peak_prices[symbol] = mid
-                    self.atr_at_entry[symbol] = self._calc_atr(bd.history, ATR_LOOKBACK) or mid * 0.02
+                    self.atr_at_entry[symbol] = (sc["atr"] or mid * 0.02)
                 elif target == 0:
                     self.entry_prices.pop(symbol, None)
                     self.peak_prices.pop(symbol, None)
@@ -362,7 +487,7 @@ class Strategy:
                 elif (target > 0 and current_pos < 0) or (target < 0 and current_pos > 0):
                     self.entry_prices[symbol] = mid
                     self.peak_prices[symbol] = mid
-                    self.atr_at_entry[symbol] = self._calc_atr(bd.history, ATR_LOOKBACK) or mid * 0.02
+                    self.atr_at_entry[symbol] = (sc["atr"] or mid * 0.02)
 
         return signals
 

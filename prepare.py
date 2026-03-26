@@ -24,15 +24,35 @@ import pyarrow.parquet as pq
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-TIME_BUDGET = 120              # backtest time budget in seconds (2 minutes)
+_BASE_TIME_BUDGET = 120        # base time budget for 1h bars (2 minutes)
 INITIAL_CAPITAL = 100_000.0    # $100K starting capital
 MAKER_FEE = 0.0002             # 2 bps
 TAKER_FEE = 0.0005             # 5 bps
 SLIPPAGE_BPS = 1.0             # 1 bps simulated slippage
 MAX_LEVERAGE = 20              # max leverage allowed
-LOOKBACK_BARS = 500            # history buffer provided to strategy
-BAR_INTERVAL = "1h"
 MAINTENANCE_MARGIN_PCT = 5.0   # % of initial capital — intra-bar liquidation threshold
+
+# ---------------------------------------------------------------------------
+# Interval configuration (BAR_INTERVAL env var, default "1h")
+# ---------------------------------------------------------------------------
+_INTERVAL_MAP = {
+    "1h": {"seconds": 3600, "bars_per_year": 8760,   "bars_per_funding": 8,  "multiplier": 1},
+    "5m": {"seconds": 300,  "bars_per_year": 105120,  "bars_per_funding": 96, "multiplier": 12},
+}
+
+def _init_interval_config():
+    global BAR_INTERVAL, BAR_SECONDS, BARS_PER_YEAR, BARS_PER_FUNDING, BAR_MULTIPLIER, LOOKBACK_BARS, TIME_BUDGET
+    BAR_INTERVAL = os.environ.get("BAR_INTERVAL", "1h")
+    assert BAR_INTERVAL in _INTERVAL_MAP, f"Unsupported interval: {BAR_INTERVAL}. Use one of: {list(_INTERVAL_MAP)}"
+    _ic = _INTERVAL_MAP[BAR_INTERVAL]
+    BAR_SECONDS = _ic["seconds"]
+    BARS_PER_YEAR = _ic["bars_per_year"]
+    BARS_PER_FUNDING = _ic["bars_per_funding"]
+    BAR_MULTIPLIER = _ic["multiplier"]
+    LOOKBACK_BARS = min(500 * BAR_MULTIPLIER, 700)  # 700 5m bars ≈ 58 1h bars (enough for all indicators)
+    TIME_BUDGET = _BASE_TIME_BUDGET * max(1, BAR_MULTIPLIER // 2)  # scale budget with bar density
+
+_init_interval_config()
 
 # ---------------------------------------------------------------------------
 # Realistic mode (REALISTIC_BACKTEST=1 env var)
@@ -44,14 +64,14 @@ REALISTIC_MODE = os.environ.get("REALISTIC_BACKTEST", "0") == "1"
 # Realistic overrides (only applied when REALISTIC_MODE is True)
 REALISTIC_TAKER_FEE = 0.00045      # 4.5bps (3.5bps taker + 1bp builder)
 REALISTIC_SLIPPAGE_BPS = 2.5       # 2.5bps (wider for mid-cap)
-REENTRY_WINDOW = 3                 # bars — re-entry within this gets penalized
-REENTRY_SLIPPAGE_MULT = 2.5        # slippage multiplier on quick re-entry
-IMPACT_THRESHOLD_PCT = 0.05        # orders > 5% of bar volume get extra slippage
-IMPACT_MULTIPLIER = 3.0            # bps per 1% of volume above threshold
-MAX_FILL_PCT_OF_VOLUME = 0.10      # cap fill at 10% of bar volume
-GAP_FREQUENCY = 168                # avg bars between connection gaps
-GAP_DURATION_MIN = 2               # min gap length
-GAP_DURATION_MAX = 4               # max gap length
+REENTRY_WINDOW = 3 * BAR_MULTIPLIER       # bars — re-entry within this gets penalized
+REENTRY_SLIPPAGE_MULT = 2.5              # slippage multiplier on quick re-entry
+IMPACT_THRESHOLD_PCT = 0.05              # orders > 5% of bar volume get extra slippage
+IMPACT_MULTIPLIER = 3.0                  # bps per 1% of volume above threshold
+MAX_FILL_PCT_OF_VOLUME = 0.10            # cap fill at 10% of bar volume
+GAP_FREQUENCY = 168 * BAR_MULTIPLIER     # avg bars between connection gaps (~1 week)
+GAP_DURATION_MIN = 2 * BAR_MULTIPLIER    # min gap length
+GAP_DURATION_MAX = 4 * BAR_MULTIPLIER    # max gap length
 
 if REALISTIC_MODE:
     TAKER_FEE = REALISTIC_TAKER_FEE
@@ -68,7 +88,7 @@ VAL_END = "2025-03-31"
 TEST_START = "2025-04-01"
 TEST_END = "2025-12-31"
 
-HOURS_PER_YEAR = 8760
+HOURS_PER_YEAR = 8760  # kept for backward compat; use BARS_PER_YEAR in new code
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -91,7 +111,7 @@ CAP_TIERS = {
     "ICP": 2, "ATOM": 2, "ARB": 2, "OP": 2, "SUI": 2, "SEI": 2,
 }
 TRAINING_TIER_MIN = {1: 2, 2: 3}  # min coins per tier in training set
-MIN_BARS_PER_SPLIT = 1000         # exclude symbols with fewer bars in a split
+MIN_BARS_PER_SPLIT = 1000 * BAR_MULTIPLIER  # exclude symbols with fewer bars in a split
 MAX_PRICE_RATIO = 1000            # exclude symbols with extreme price swings (bad data)
 
 # ---------------------------------------------------------------------------
@@ -246,7 +266,7 @@ def _validate_symbols(symbols, split="val"):
 
     valid = []
     for symbol in symbols:
-        filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
+        filepath = os.path.join(DATA_DIR, f"{symbol}_{BAR_INTERVAL}.parquet")
         if not os.path.exists(filepath):
             continue
         df = pd.read_parquet(filepath)
@@ -403,7 +423,8 @@ def _download_hl_candles(symbol: str, interval: str, start_ms: int, end_ms: int)
     """Download OHLCV candles from Hyperliquid."""
     all_rows = []
     current = start_ms
-    chunk_ms = 30 * 24 * 3600 * 1000  # 30 days
+    chunk_days = max(3, 30 // BAR_MULTIPLIER)
+    chunk_ms = chunk_days * 24 * 3600 * 1000
     while current < end_ms:
         body = {
             "type": "candleSnapshot",
@@ -430,11 +451,71 @@ def _download_hl_candles(symbol: str, interval: str, start_ms: int, end_ms: int)
                     "close": float(row["c"]),
                     "volume": float(row["v"]),
                 })
-            current = int(data[-1]["t"]) + 3600 * 1000
+            current = int(data[-1]["t"]) + BAR_SECONDS * 1000
         except Exception:
             current += chunk_ms
         time.sleep(0.2)
     return pd.DataFrame(all_rows)
+
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+# Symbols that need special Binance ticker mapping (spot API tickers)
+_BINANCE_SYMBOL_MAP = {
+    "kPEPE": "PEPE",
+    "kSHIB": "SHIB",
+    "kFLOKI": "FLOKI",
+    "kBONK": "BONK",
+    "kLUNC": "LUNC",
+}
+
+def _to_binance_symbol(symbol: str) -> str:
+    """Convert internal symbol to Binance ticker (e.g., BTC → BTCUSDT)."""
+    mapped = _BINANCE_SYMBOL_MAP.get(symbol, symbol)
+    return f"{mapped}USDT"
+
+
+def _download_binance_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Download OHLCV candles from Binance Klines API."""
+    binance_sym = _to_binance_symbol(symbol)
+    all_rows = []
+    current = start_ms
+
+    while current < end_ms:
+        params = {
+            "symbol": binance_sym,
+            "interval": interval,
+            "startTime": current,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+        try:
+            resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for bar in data:
+                all_rows.append({
+                    "timestamp": int(bar[0]),           # open time
+                    "open": float(bar[1]),
+                    "high": float(bar[2]),
+                    "low": float(bar[3]),
+                    "close": float(bar[4]),
+                    "volume": float(bar[5]),            # base asset volume
+                })
+            # Advance past last bar
+            current = int(data[-1][0]) + BAR_SECONDS * 1000
+            if len(data) < 1000:
+                break  # no more data
+        except Exception:
+            break
+        time.sleep(0.2)
+
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    return df
 
 
 def download_data(symbols=None):
@@ -448,19 +529,25 @@ def download_data(symbols=None):
 
     total = len(symbols)
     for idx, symbol in enumerate(symbols, 1):
-        filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
+        filepath = os.path.join(DATA_DIR, f"{symbol}_{BAR_INTERVAL}.parquet")
         if os.path.exists(filepath):
             existing = pd.read_parquet(filepath)
             print(f"  [{idx}/{total}] {symbol}: already have {len(existing)} bars")
             continue
 
-        print(f"  [{idx}/{total}] {symbol}: downloading candles from CryptoCompare...")
-
-        # Use CryptoCompare for reliable historical OHLCV (no geo-restrictions)
-        df = _download_cryptocompare_candles(symbol, start_ms, end_ms)
-        if len(df) < 100:
-            print(f"  {symbol}: CryptoCompare insufficient ({len(df)} bars), trying HL...")
-            df = _download_hl_candles(symbol, "1h", start_ms, end_ms)
+        if BAR_INTERVAL == "1h":
+            print(f"  [{idx}/{total}] {symbol}: downloading candles from CryptoCompare...")
+            # Use CryptoCompare for reliable historical OHLCV (no geo-restrictions)
+            df = _download_cryptocompare_candles(symbol, start_ms, end_ms)
+            if len(df) < 100:
+                print(f"  {symbol}: CryptoCompare insufficient ({len(df)} bars), trying HL...")
+                df = _download_hl_candles(symbol, BAR_INTERVAL, start_ms, end_ms)
+        else:
+            print(f"  [{idx}/{total}] {symbol}: downloading {BAR_INTERVAL} candles from Binance...")
+            df = _download_binance_candles(symbol, BAR_INTERVAL, start_ms, end_ms)
+            if len(df) < 100:
+                print(f"  {symbol}: Binance insufficient ({len(df)} bars), trying HL...")
+                df = _download_hl_candles(symbol, BAR_INTERVAL, start_ms, end_ms)
 
         if df.empty:
             print(f"  {symbol}: NO DATA AVAILABLE, skipping")
@@ -474,7 +561,7 @@ def download_data(symbols=None):
         df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         if not funding.empty:
             funding = funding.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-            # Merge nearest — funding is every 8h, candles every 1h
+            # Merge nearest — funding is every 8h, candles every bar interval
             df = pd.merge_asof(df, funding, on="timestamp", direction="backward")
         if "funding_rate" not in df.columns:
             df["funding_rate"] = 0.0
@@ -506,7 +593,7 @@ def load_data(split: str = "val", symbols=None) -> dict:
 
     result = {}
     for symbol in symbols:
-        filepath = os.path.join(DATA_DIR, f"{symbol}_1h.parquet")
+        filepath = os.path.join(DATA_DIR, f"{symbol}_{BAR_INTERVAL}.parquet")
         if not os.path.exists(filepath):
             continue
         df = pd.read_parquet(filepath)
@@ -549,15 +636,28 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
     if not timestamps:
         return BacktestResult()
 
-    # Index data by symbol: sort by timestamp, use positional pointers
+    # Index data by symbol: sort by timestamp, pre-extract numpy arrays
     symbol_dfs = {}
     symbol_ts = {}  # timestamp arrays for O(1) compare
     symbol_ptrs = {}
+    # Pre-extracted numpy arrays — eliminates pandas iloc from hot loop
+    sym_opens = {}
+    sym_highs = {}
+    sym_lows = {}
+    sym_closes = {}
+    sym_volumes = {}
+    sym_funding = {}
     for symbol, df in data.items():
         sdf = df.sort_values("timestamp").reset_index(drop=True)
         symbol_dfs[symbol] = sdf
         symbol_ts[symbol] = sdf["timestamp"].values
         symbol_ptrs[symbol] = 0
+        sym_opens[symbol] = sdf["open"].values
+        sym_highs[symbol] = sdf["high"].values
+        sym_lows[symbol] = sdf["low"].values
+        sym_closes[symbol] = sdf["close"].values
+        sym_volumes[symbol] = sdf["volume"].values
+        sym_funding[symbol] = sdf["funding_rate"].values if "funding_rate" in sdf.columns else np.zeros(len(sdf))
 
     def _calc_unrealized_pnl(positions, entry_prices, bar_data):
         pnl = 0.0
@@ -608,14 +708,20 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
         next_gap = rng.geometric(1.0 / GAP_FREQUENCY)
     pending_signals = []  # for next-bar-open execution in realistic mode
 
+    _time_check_interval = 200  # check wall clock every N bars (avoid syscall overhead)
+    _bars_since_check = 0
     for ts in timestamps:
-        elapsed = time.time() - t_start
-        if elapsed > TIME_BUDGET:
-            break
+        _bars_since_check += 1
+        if _bars_since_check >= _time_check_interval:
+            _bars_since_check = 0
+            if time.time() - t_start > TIME_BUDGET:
+                break
 
         portfolio.timestamp = ts
 
-        # Build bar data using pointer iteration + iloc pre-slicing
+        # Build bar data using pointer iteration + pre-extracted numpy arrays
+        # For sub-hourly bars, only build full history at hour boundaries
+        is_hour_boundary = BAR_MULTIPLIER == 1 or (ts % 3600000 == 0)
         bar_data = {}
         for symbol in data:
             ptr = symbol_ptrs[symbol]
@@ -625,22 +731,24 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
             if ts_arr[ptr] != ts:
                 continue
 
-            sdf = symbol_dfs[symbol]
-            row = sdf.iloc[ptr]
+            # Direct numpy array access — no pandas iloc
+            o = float(sym_opens[symbol][ptr])
+            h = float(sym_highs[symbol][ptr])
+            l = float(sym_lows[symbol][ptr])
+            c = float(sym_closes[symbol][ptr])
+            v = float(sym_volumes[symbol][ptr])
+            fr = float(sym_funding[symbol][ptr])
 
-            # iloc window for history (replaces list-of-dicts + DataFrame construction)
-            start = max(0, ptr - LOOKBACK_BARS + 1)
-            hist_df = sdf.iloc[start:ptr + 1]
+            if is_hour_boundary:
+                start = max(0, ptr - LOOKBACK_BARS + 1)
+                hist_df = symbol_dfs[symbol].iloc[start:ptr + 1]
+            else:
+                hist_df = None  # strategy uses cached indicators between hours
 
             bar_data[symbol] = BarData(
-                symbol=symbol,
-                timestamp=ts,
-                open=row["open"],
-                high=row["high"],
-                low=row["low"],
-                close=row["close"],
-                volume=row["volume"],
-                funding_rate=row.get("funding_rate", 0.0) if "funding_rate" in sdf.columns else 0.0,
+                symbol=symbol, timestamp=ts,
+                open=o, high=h, low=l, close=c,
+                volume=v, funding_rate=fr,
                 history=hist_df,
             )
             symbol_ptrs[symbol] = ptr + 1
@@ -659,8 +767,8 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
             if sym in bar_data:
                 fr = bar_data[sym].funding_rate
                 # Funding: longs pay when positive, shorts receive
-                # Applied every 8h, but we have hourly bars so scale by 1/8
-                funding_payment = pos_notional * fr / 8.0
+                # Applied every 8h, scaled by bars per funding period
+                funding_payment = pos_notional * fr / BARS_PER_FUNDING
                 portfolio.cash -= funding_payment
 
         # --- Realistic: connection gap simulation ---
@@ -967,9 +1075,9 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
     returns = np.array(hourly_returns) if hourly_returns else np.array([0.0])
     eq = np.array(equity_curve)
 
-    # Sharpe ratio (annualized from hourly)
+    # Sharpe ratio (annualized from bar returns)
     if returns.std() > 0:
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(HOURS_PER_YEAR)
+        sharpe = (returns.mean() / returns.std()) * np.sqrt(BARS_PER_YEAR)
     else:
         sharpe = 0.0
 
@@ -997,9 +1105,9 @@ def run_backtest(strategy, data: dict, intra_bar_sim: bool = False) -> BacktestR
         profit_factor = 0.0
 
     # Annual turnover
-    data_hours = len(timestamps)
-    if data_hours > 0:
-        annual_turnover = total_volume * (HOURS_PER_YEAR / data_hours)
+    data_bars = len(timestamps)
+    if data_bars > 0:
+        annual_turnover = total_volume * (BARS_PER_YEAR / data_bars)
     else:
         annual_turnover = 0.0
 
@@ -1060,7 +1168,13 @@ if __name__ == "__main__":
     parser.add_argument("--discover", action="store_true", help="Print discovered universe and exit")
     parser.add_argument("--refresh", action="store_true", help="Force re-discovery (ignore cache)")
     parser.add_argument("--info", action="store_true", help="Show data completeness per symbol")
+    parser.add_argument("--interval", default=None, choices=list(_INTERVAL_MAP.keys()),
+                        help="Bar interval (default: from BAR_INTERVAL env var, or 1h)")
     args = parser.parse_args()
+
+    if args.interval:
+        os.environ["BAR_INTERVAL"] = args.interval
+        _init_interval_config()
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
@@ -1091,11 +1205,11 @@ if __name__ == "__main__":
                 if sym in data:
                     print(f"    {sym}: {len(data[sym])} bars")
                 else:
-                    filepath = os.path.join(DATA_DIR, f"{sym}_1h.parquet")
+                    filepath = os.path.join(DATA_DIR, f"{sym}_{BAR_INTERVAL}.parquet")
                     if not os.path.exists(filepath):
                         print(f"    {sym}: no data file")
                     else:
-                        print(f"    {sym}: excluded (< 1000 bars)")
+                        print(f"    {sym}: excluded (< {MIN_BARS_PER_SPLIT} bars)")
         sys.exit(0)
 
     print("Downloading data...")
