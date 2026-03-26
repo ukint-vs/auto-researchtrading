@@ -11,10 +11,37 @@ Exits: GGOSC TP1 (0.8x ATR from entry), SDO-tightened trailing stop
   (78/22), signal flip.
 Live constraints: COOLDOWN=1, MIN_ENTRY_MOVE=15bps fee buffer.
 
-Score: gate1 27.33 / gate2 20.67 / ratio 0.76
+Score (1h): gate1 27.33 / gate2 20.67 / ratio 0.76
+Score (5m): gate1 22.99 / gate2 20.73 / ratio 0.90
 OOS: test 29.35 (ratio 0.78), train 23.69 (ratio 0.78)
 Evolution: s1-s3 (32.06 pre-realism) → s4 live-realism cleanup (22.38)
   → s5 parameter tuning (24.85) → s6 GGOSC integration (27.33)
+  → s7 exp1: GGOSC_TP1_MULT 0.8→1.2 (5m: 16.15→16.24, ratio 0.71)
+  → s7 exp2: SDO_TIGHT_ATR_MULT 1.85→3.0 (5m: 16.24→17.70, ratio 0.74)
+  → s7 exp3: RSI exit 78/22→90/10 (5m: 17.70→20.40, ratio 0.88, WR 71%)
+  → s7 exp6: EMA_SLOW 23→30 (5m: 20.40→20.48, ratio 0.88)
+  → s7 exp9: GGOSC 3/10→2/8 (5m: 20.48→20.68, ratio 0.87)
+  → s7 exp12: ATR_LOOKBACK 12→16 (5m: 20.68→20.73, ratio 0.88)
+  → s7 exp13: SDO thresholds 85/15→95/5 (5m: 20.73→20.84, ratio 0.88)
+  → s7 exp14: RSI_PERIOD 8→16 (5m: 20.84→21.04, ratio 0.88)
+  → s7 exp16: RSI_DIV_LOOKBACK 14→12 (5m: 21.04→21.05, ratio 0.88)
+  → s7 exp18: Donchian 60%→55% breakout (5m: 21.05→21.25, ratio 0.88)
+  → s7 exp19: vshort threshold 0.6→1.0 (5m: 21.25→21.33, ratio 0.88)
+  → s7 exp20: vol_mix 0.3/0.7→0.0/1.0 (5m: 21.33→21.39, ratio 0.88)
+  → s7 exp23: SDO_SMOOTH_LEN 3→2 (5m: 21.39→21.44, ratio 0.88)
+  → s7 exp31: SDO_STOCH_LEN 8→6 (5m: 21.44→21.45, ratio 0.88)
+  → s7 exp33: DONCH_LOOKBACK 8→7 (5m: 21.45→21.46, ratio 0.88)
+  → s7 exp37: v3 squeeze filter SDO/RSI/GGOSC (5m: 21.46→21.48, ratio 0.88)
+  → s7 exp38: SDO_DONCH_LEN 14→16 (5m: 21.48→21.49, ratio 0.88)
+  → s7 exp39: RSI-adaptive TP (5m: 21.49→21.58, ratio 0.86, WR 71.4%)
+  → s7 exp40: TP coefficients 0.8/0.4→0.75/0.5 (5m: 21.58→21.69, ratio 0.87)
+  → s7 exp41: vote-weighted sizing 0.8-1.2x (5m: 21.69→21.74, ratio 0.87)
+  → s7 exp42: vote scaling 0.7/0.2/1.2 (5m: 21.74→21.95, ratio 0.87, WR 72%)
+  → s7 exp43: vote base 0.7→0.5 (5m: 21.95→22.16, ratio 0.88, PF 15.2)
+  → s7 exp44: vote hi_scale 0.2→0.15 (5m: 22.16→22.21, ratio 0.88)
+  → s7 exp45: EMA trend regime 0.1% gap filter (5m: 22.21→22.44, ratio 0.88)
+  → s7 exp46: EMA gap 0.1→0.08% (5m: 22.44→22.47, ratio 0.88)
+  → s7 exp47: RSI_ENTRY_PERIOD 4→5 (5m: 22.47→22.99, ratio 0.90, WR 74.5%!)
 """
 
 import numpy as np
@@ -31,15 +58,15 @@ MED_WINDOW = 12
 
 # EMA crossover (1h bars)
 EMA_FAST = 3
-EMA_SLOW = 23
+EMA_SLOW = 30
 
 # RSI (1h bars)
-RSI_PERIOD = 8
-RSI_ENTRY_PERIOD = 4
+RSI_PERIOD = 16
+RSI_ENTRY_PERIOD = 5
 RSI_BULL = 45
 RSI_BEAR = 55
-RSI_OVERBOUGHT = 78
-RSI_OVERSOLD = 22
+RSI_OVERBOUGHT = 90
+RSI_OVERSOLD = 10
 
 # MACD (1h bars)
 MACD_FAST = 7
@@ -53,25 +80,25 @@ TARGET_VOL = 0.015
 BASE_THRESHOLD = 0.013
 
 # SDO stop tightening (1h bars)
-ATR_LOOKBACK = 12
-SDO_STOCH_LEN = 8
-SDO_DONCH_LEN = 14
-SDO_SMOOTH_LEN = 3
-SDO_OVERBOUGHT = 85
-SDO_OVERSOLD = 15
-SDO_TIGHT_ATR_MULT = 1.85
+ATR_LOOKBACK = 16
+SDO_STOCH_LEN = 6
+SDO_DONCH_LEN = 16
+SDO_SMOOTH_LEN = 2
+SDO_OVERBOUGHT = 95
+SDO_OVERSOLD = 5
+SDO_TIGHT_ATR_MULT = 3.0
 
 # Donchian breakout (1h bars)
-DONCH_LOOKBACK = 8
+DONCH_LOOKBACK = 7
 
 # RSI divergence (1h bars)
-RSI_DIV_LOOKBACK = 14
+RSI_DIV_LOOKBACK = 12
 
 # GGOSC oscillator (1h bars — entry confirmation + TP exits)
-GGOSC_FAST = 3
-GGOSC_SLOW = 10
+GGOSC_FAST = 2
+GGOSC_SLOW = 8
 GGOSC_SIGNAL = 3
-GGOSC_TP1_MULT = 0.8       # ATR multiple for take-profit
+GGOSC_TP1_MULT = 1.2       # ATR multiple for take-profit
 
 # Trade management — COOLDOWN is in execution-TF bars (5m when BAR_MULTIPLIER=12)
 COOLDOWN_BARS = 1 * BAR_MULTIPLIER
@@ -338,7 +365,7 @@ class Strategy:
 
         realized_vol = self._calc_vol(closes, VOL_LOOKBACK)
         vol_ratio = realized_vol / TARGET_VOL
-        dyn_threshold = BASE_THRESHOLD * (0.3 + vol_ratio * 0.7)
+        dyn_threshold = BASE_THRESHOLD * (0.0 + vol_ratio * 1.0)
         dyn_threshold = max(0.005, min(0.025, dyn_threshold))
 
         ret_vshort = np.log(closes[-1] / closes[-SHORT_WINDOW])
@@ -346,8 +373,8 @@ class Strategy:
 
         mom_bull = ret_short > dyn_threshold
         mom_bear = ret_short < -dyn_threshold
-        vshort_bull = ret_vshort > dyn_threshold * 0.6
-        vshort_bear = ret_vshort < -dyn_threshold * 0.6
+        vshort_bull = ret_vshort > dyn_threshold * 1.0
+        vshort_bear = ret_vshort < -dyn_threshold * 1.0
 
         ema_fast_arr = ema(closes[-(EMA_SLOW+10):], EMA_FAST)
         ema_slow_arr = ema(closes[-(EMA_SLOW+10):], EMA_SLOW)
@@ -361,28 +388,45 @@ class Strategy:
         donch_high = np.max(closes[-DONCH_LOOKBACK:-1])
         donch_low = np.min(closes[-DONCH_LOOKBACK:-1])
         donch_range = donch_high - donch_low
-        donch_bull = closes[-1] >= donch_low + donch_range * 0.60
-        donch_bear = closes[-1] <= donch_low + donch_range * 0.40
+        donch_bull = closes[-1] >= donch_low + donch_range * 0.55
+        donch_bear = closes[-1] <= donch_low + donch_range * 0.45
 
         # GGOSC oscillator as 8th signal
         ggosc_val = self._calc_ggosc(highs, lows, closes)
         ggosc_bull = ggosc_val > 0
         ggosc_bear = ggosc_val < 0
 
+        # Compute SDO and ATR early (needed for squeeze filter)
+        atr = self._calc_atr(highs, lows, closes, ATR_LOOKBACK)
+        sdo_val, _ = self._calc_sdo(highs, lows, closes)
+
         # 8-signal ensemble vote (5/8 = 62.5%)
         bull_votes = sum([mom_bull, vshort_bull, ema_bull, rsi > RSI_BULL, macd_hist > 0, has_bull_div, donch_bull, ggosc_bull])
         bear_votes = sum([mom_bear, vshort_bear, ema_bear, rsi < RSI_BEAR, macd_hist < 0, has_bear_div, donch_bear, ggosc_bear])
+
+        # EMA trend regime: skip when EMAs too close (no clear trend)
+        ema_gap = abs(ema_fast_arr[-1] - ema_slow_arr[-1]) / ema_slow_arr[-1]
+        if ema_gap < 0.0008:
+            bull_votes = 0
+            bear_votes = 0
+
+        # Squeeze filter: reject when all oscillators show no conviction
+        sdo_mid = abs(sdo_val[-1] - 50) < 12 if len(sdo_val) > 0 else False
+        rsi_mid = abs(rsi - 50) < 8
+        ggosc_mid = abs(ggosc_val) < 0.1
+        if sdo_mid and rsi_mid and ggosc_mid:
+            bull_votes = 0
+            bear_votes = 0
 
         if abs(ret_short) < MIN_ENTRY_MOVE:
             bull_votes = 0
             bear_votes = 0
 
-        atr = self._calc_atr(highs, lows, closes, ATR_LOOKBACK)
-        sdo_val, _ = self._calc_sdo(highs, lows, closes)
-
         self._signal_cache[symbol] = {
             "bullish": bull_votes >= MIN_VOTES,
             "bearish": bear_votes >= MIN_VOTES,
+            "bull_votes": bull_votes,
+            "bear_votes": bear_votes,
             "size": equity * BASE_POSITION_PCT * self._weight,
             "rsi": rsi,
             "atr": atr,
@@ -423,9 +467,11 @@ class Strategy:
             if current_pos == 0:
                 if not in_cooldown:
                     if bullish:
-                        target = size
+                        vote_scale = 0.5 + 0.15 * (sc.get("bull_votes", MIN_VOTES) - MIN_VOTES) / max(8 - MIN_VOTES, 1)
+                        target = size * min(vote_scale, 1.2)
                     elif bearish:
-                        target = -size
+                        vote_scale = 0.5 + 0.15 * (sc.get("bear_votes", MIN_VOTES) - MIN_VOTES) / max(8 - MIN_VOTES, 1)
+                        target = -size * min(vote_scale, 1.2)
             else:
                 atr = sc["atr"]
                 if atr is None:
@@ -456,9 +502,11 @@ class Strategy:
                 if symbol in self.entry_prices:
                     entry = self.entry_prices[symbol]
                     entry_atr = self.atr_at_entry.get(symbol, mid * 0.02)
-                    if current_pos > 0 and mid >= entry + GGOSC_TP1_MULT * entry_atr:
+                    rsi_room = (RSI_OVERBOUGHT - rsi) / 100 if current_pos > 0 else (rsi - RSI_OVERSOLD) / 100
+                    tp_adj = GGOSC_TP1_MULT * (0.75 + rsi_room * 0.5)
+                    if current_pos > 0 and mid >= entry + tp_adj * entry_atr:
                         target = 0.0
-                    elif current_pos < 0 and mid <= entry - GGOSC_TP1_MULT * entry_atr:
+                    elif current_pos < 0 and mid <= entry - tp_adj * entry_atr:
                         target = 0.0
 
                 # RSI mean-reversion exit (1h)
